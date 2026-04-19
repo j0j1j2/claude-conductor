@@ -14,12 +14,24 @@ You give a high-level goal to the **master** Claude. The master writes prompts f
 
 ## Install
 
+One-liner (requires Go 1.22+):
+
 ```bash
-go install github.com/j0j1j2/claude-conductor@latest
-# or from source:
+go install github.com/j0j1j2/claude-conductor/cmd/conductor@latest
+```
+
+This drops a `conductor` binary into `$(go env GOPATH)/bin` — make sure that directory is on your `PATH`. Verify:
+
+```bash
+conductor --help
+```
+
+From source:
+
+```bash
 git clone https://github.com/j0j1j2/claude-conductor
 cd claude-conductor
-go install ./...
+go install ./cmd/conductor
 ```
 
 ## Usage
