@@ -16,7 +16,7 @@ var cmdStart time.Time
 var Root = &cobra.Command{
 	Use:   "conductor",
 	Short: "Master-slave orchestrator for Claude Code sessions in tmux",
-	// RunE is wired in Task 16 (bootstrap).
+	RunE: runRootBootstrap,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		cmdStart = time.Now()
 	},
