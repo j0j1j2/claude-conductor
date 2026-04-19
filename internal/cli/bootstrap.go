@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -64,7 +67,7 @@ func runRootBootstrap(cmd *cobra.Command, args []string) error {
 // outsideTmux: create (or attach to) the tmux session, then re-enter
 // `conductor` from inside window 0 via send-keys.
 func outsideTmux(projectCwd string) error {
-	sessionName := "conductor"
+	sessionName := sessionNameFromCwd(projectCwd)
 	conductorBin, err := os.Executable()
 	if err != nil {
 		return err
@@ -102,6 +105,23 @@ func outsideTmux(projectCwd string) error {
 	att := tmux.AttachSessionCmd(sessionName)
 	att.Stdin, att.Stdout, att.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return att.Run()
+}
+
+// sessionNameFromCwd builds a tmux session name unique per project directory.
+// Format: "conductor-<basename>-<short-hash>". The hash disambiguates two
+// different directories that happen to share a basename.
+func sessionNameFromCwd(cwd string) string {
+	base := filepath.Base(cwd)
+	// Sanitize: tmux dislikes '.' and ':' in session names.
+	base = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, base)
+	sum := sha1.Sum([]byte(cwd))
+	return fmt.Sprintf("conductor-%s-%s", base, hex.EncodeToString(sum[:3]))
 }
 
 // insideTmux: do per-session setup, pre-spawn s1, then *replace* this
