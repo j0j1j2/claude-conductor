@@ -1,7 +1,6 @@
-package cmd
+package cli
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/cloudchamb3r/claude-conductor/internal/exitcode"
@@ -10,9 +9,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var lastCmd = &cobra.Command{
-	Use:   "last <slave-id>",
-	Short: "Print slave's last assistant response (non-blocking)",
+var killCmd = &cobra.Command{
+	Use:   "kill <slave-id>",
+	Short: "Close the slave's tmux window and remove its state dir",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !tmux.InTmux() {
@@ -26,18 +25,16 @@ var lastCmd = &cobra.Command{
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
-		content, err := state.ReadDone(state.SlaveDir(sess, id))
-		if err != nil {
-			if os.IsNotExist(err) {
-				return CLIError(exitcode.InternalError, "no prior response for %s", id)
-			}
-			return err
+
+		_ = tmux.KillWindowCmd(sess, id).Run()
+
+		if err := os.RemoveAll(state.SlaveDir(sess, id)); err != nil {
+			return CLIError(exitcode.InternalError, "remove state dir: %v", err)
 		}
-		fmt.Print(content)
 		return nil
 	},
 }
 
 func init() {
-	Root.AddCommand(lastCmd)
+	Root.AddCommand(killCmd)
 }

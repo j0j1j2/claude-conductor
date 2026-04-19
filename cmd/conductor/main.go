@@ -5,16 +5,16 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cloudchamb3r/claude-conductor/cmd"
+	"github.com/cloudchamb3r/claude-conductor/internal/cli"
 	"github.com/cloudchamb3r/claude-conductor/internal/exitcode"
 )
 
 func main() {
-	executed, execErr := cmd.ExecuteRoot()
+	executed, execErr := cli.ExecuteRoot()
 	exit := 0
 	if execErr != nil {
 		fmt.Fprintln(os.Stderr, execErr)
-		var ee *cmd.ExitError
+		var ee *cli.ExitError
 		if errors.As(execErr, &ee) {
 			exit = ee.Code
 		} else {
@@ -22,7 +22,7 @@ func main() {
 		}
 	}
 	if executed != nil {
-		cmd.WriteAudit(executed, os.Args[1:], exit)
+		cli.WriteAudit(executed, os.Args[1:], exit)
 	}
 	os.Exit(exit)
 }

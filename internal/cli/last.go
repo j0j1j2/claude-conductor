@@ -1,15 +1,18 @@
-package cmd
+package cli
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/cloudchamb3r/claude-conductor/internal/exitcode"
 	"github.com/cloudchamb3r/claude-conductor/internal/state"
 	"github.com/cloudchamb3r/claude-conductor/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
-var interruptCmd = &cobra.Command{
-	Use:   "interrupt <slave-id>",
-	Short: "Cancel the slave's current turn (sends Escape)",
+var lastCmd = &cobra.Command{
+	Use:   "last <slave-id>",
+	Short: "Print slave's last assistant response (non-blocking)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !tmux.InTmux() {
@@ -23,13 +26,18 @@ var interruptCmd = &cobra.Command{
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
-		if err := tmux.SendKeysCmd(sess, id, "Escape").Run(); err != nil {
-			return CLIError(exitcode.InternalError, "send Escape: %v", err)
+		content, err := state.ReadDone(state.SlaveDir(sess, id))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return CLIError(exitcode.InternalError, "no prior response for %s", id)
+			}
+			return err
 		}
+		fmt.Print(content)
 		return nil
 	},
 }
 
 func init() {
-	Root.AddCommand(interruptCmd)
+	Root.AddCommand(lastCmd)
 }
