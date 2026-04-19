@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cloudchamb3r/claude-conductor/internal/state"
-	"github.com/cloudchamb3r/claude-conductor/internal/transcript"
-	"github.com/cloudchamb3r/claude-conductor/internal/tmux"
+	"github.com/j0j1j2/claude-conductor/internal/state"
+	"github.com/j0j1j2/claude-conductor/internal/transcript"
+	"github.com/j0j1j2/claude-conductor/internal/tmux"
 	"github.com/spf13/cobra"
 )
 

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cloudchamb3r/claude-conductor/internal/cli"
-	"github.com/cloudchamb3r/claude-conductor/internal/exitcode"
+	"github.com/j0j1j2/claude-conductor/internal/cli"
+	"github.com/j0j1j2/claude-conductor/internal/exitcode"
 )
 
 func main() {

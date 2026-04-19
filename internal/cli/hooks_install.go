@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cloudchamb3r/claude-conductor/internal/hooks"
+	"github.com/j0j1j2/claude-conductor/internal/hooks"
 )
 
 // installProjectHooks writes the conductor-compatible hook settings to

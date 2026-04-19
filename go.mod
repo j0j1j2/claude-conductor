@@ -1,4 +1,4 @@
-module github.com/cloudchamb3r/claude-conductor
+module github.com/j0j1j2/claude-conductor
 
 go 1.25.5
 

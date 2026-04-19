@@ -15,9 +15,9 @@ You give a high-level goal to the **master** Claude. The master writes prompts f
 ## Install
 
 ```bash
-go install github.com/cloudchamb3r/claude-conductor@latest
+go install github.com/j0j1j2/claude-conductor@latest
 # or from source:
-git clone https://github.com/cloudchamb3r/claude-conductor
+git clone https://github.com/j0j1j2/claude-conductor
 cd claude-conductor
 go install ./...
 ```
