@@ -1,0 +1,6 @@
+{"type":"user","message":{"role":"user","content":"hi"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello there."}]}}
+{"type":"user","message":{"role":"user","content":"2+2?"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Calc","input":{}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"4"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The answer is 4."}]}}
