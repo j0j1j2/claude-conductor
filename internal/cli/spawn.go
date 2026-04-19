@@ -53,12 +53,13 @@ var spawnCmd = &cobra.Command{
 			return err
 		}
 
-		settingsPath := filepath.Join(slaveDir, "settings.json")
-		if err := os.WriteFile(settingsPath, []byte(hooks.RenderSettings(id, conductorBin)), 0o644); err != nil {
-			return err
+		// Ensure the project-level hook settings are installed (no-op if already written).
+		if err := installProjectHooks(projectCwd, conductorBin); err != nil {
+			return CLIError(exitcode.InternalError, "install project hooks: %v", err)
 		}
+
 		runShPath := filepath.Join(slaveDir, "run.sh")
-		runShContent := hooks.RenderRunScript(slaveDir, projectCwd)
+		runShContent := hooks.RenderRunScript(slaveDir, projectCwd, id)
 		if err := os.WriteFile(runShPath, []byte(runShContent), 0o755); err != nil {
 			return err
 		}

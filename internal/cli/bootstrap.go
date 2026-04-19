@@ -95,6 +95,11 @@ func runRootBootstrap(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	conductorBin, _ := os.Executable()
+	if err := installProjectHooks(projectCwd, conductorBin); err != nil {
+		return CLIError(exitcode.InternalError, "install project hooks: %v", err)
+	}
+
 	masterLaunch := fmt.Sprintf(
 		`cd %q && claude --append-system-prompt "$(cat %q)" --dangerously-skip-permissions`,
 		projectCwd, systemPath)
@@ -102,7 +107,6 @@ func runRootBootstrap(cmd *cobra.Command, args []string) error {
 		return CLIError(exitcode.InternalError, "launch master: %v", err)
 	}
 
-	conductorBin, _ := os.Executable()
 	spawnCmd := exec.Command(conductorBin, "spawn", "--name", "s1")
 	spawnCmd.Stdout = os.Stdout
 	spawnCmd.Stderr = os.Stderr
