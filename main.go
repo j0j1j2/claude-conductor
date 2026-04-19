@@ -10,14 +10,19 @@ import (
 )
 
 func main() {
-	err := cmd.Root.Execute()
-	if err == nil {
-		return
+	executed, execErr := cmd.ExecuteRoot()
+	exit := 0
+	if execErr != nil {
+		fmt.Fprintln(os.Stderr, execErr)
+		var ee *cmd.ExitError
+		if errors.As(execErr, &ee) {
+			exit = ee.Code
+		} else {
+			exit = exitcode.InternalError
+		}
 	}
-	fmt.Fprintln(os.Stderr, err)
-	var ee *cmd.ExitError
-	if errors.As(err, &ee) {
-		os.Exit(ee.Code)
+	if executed != nil {
+		cmd.WriteAudit(executed, os.Args[1:], exit)
 	}
-	os.Exit(exitcode.InternalError)
+	os.Exit(exit)
 }
