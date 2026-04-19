@@ -29,9 +29,11 @@ func PasteBufferCmd(session, window string) *exec.Cmd {
 	return exec.Command("tmux", "paste-buffer", "-t", session+":"+window)
 }
 
-// NewWindowCmd builds `tmux new-window -t <session> -n <name> <cmd>`.
+// NewWindowCmd builds `tmux new-window -d -t <session> -n <name> <cmd>`.
+// The -d flag creates the window without switching focus to it, so spawning
+// a slave does not yank the user away from the master window.
 func NewWindowCmd(session, name, command string) *exec.Cmd {
-	return exec.Command("tmux", "new-window", "-t", session, "-n", name, command)
+	return exec.Command("tmux", "new-window", "-d", "-t", session, "-n", name, command)
 }
 
 // KillWindowCmd builds `tmux kill-window -t <session>:<window>`.

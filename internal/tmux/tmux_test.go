@@ -31,7 +31,7 @@ func TestPasteBufferCmd(t *testing.T) {
 func TestNewWindowCmd(t *testing.T) {
 	c := NewWindowCmd("sess", "s2", "/path/to/run.sh")
 	args := strings.Join(c.Args, " ")
-	if !strings.Contains(args, "new-window -t sess -n s2 /path/to/run.sh") {
+	if !strings.Contains(args, "new-window -d -t sess -n s2 /path/to/run.sh") {
 		t.Errorf("unexpected args: %v", c.Args)
 	}
 }
