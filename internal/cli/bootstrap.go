@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/cloudchamb3r/claude-conductor/internal/exitcode"
@@ -55,26 +56,50 @@ func runRootBootstrap(cmd *cobra.Command, args []string) error {
 	}
 
 	if !tmux.InTmux() {
-		sessionName := "conductor"
-		conductorBin, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		if tmux.HasSessionCmd(sessionName).Run() == nil {
-			att := tmux.AttachSessionCmd(sessionName)
-			att.Stdin, att.Stdout, att.Stderr = os.Stdin, os.Stdout, os.Stderr
-			return att.Run()
-		}
-		newCmd := tmux.NewSessionCmd(sessionName, conductorBin)
-		newCmd.Dir = projectCwd
-		if err := newCmd.Run(); err != nil {
-			return CLIError(exitcode.InternalError, "tmux new-session: %v", err)
-		}
+		return outsideTmux(projectCwd)
+	}
+	return insideTmux(projectCwd)
+}
+
+// outsideTmux: create (or attach to) the tmux session, then re-enter
+// `conductor` from inside window 0 via send-keys.
+func outsideTmux(projectCwd string) error {
+	sessionName := "conductor"
+	conductorBin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	// If session already exists, just attach.
+	if tmux.HasSessionCmd(sessionName).Run() == nil {
 		att := tmux.AttachSessionCmd(sessionName)
 		att.Stdin, att.Stdout, att.Stderr = os.Stdin, os.Stdout, os.Stderr
 		return att.Run()
 	}
 
+	// Create session with the default shell in window 0 (NOT conductor —
+	// if we ran the conductor binary directly as the pane process, window 0
+	// would close as soon as this function returned).
+	newCmd := tmux.NewSessionCmdShell(sessionName)
+	newCmd.Dir = projectCwd
+	if err := newCmd.Run(); err != nil {
+		return CLIError(exitcode.InternalError, "tmux new-session: %v", err)
+	}
+
+	// Type `conductor` into window 0's shell so we re-enter with $TMUX set.
+	if err := tmux.SendKeysCmd(sessionName, "0", conductorBin, "Enter").Run(); err != nil {
+		return CLIError(exitcode.InternalError, "send-keys conductor: %v", err)
+	}
+
+	// Attach.
+	att := tmux.AttachSessionCmd(sessionName)
+	att.Stdin, att.Stdout, att.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return att.Run()
+}
+
+// insideTmux: do per-session setup, pre-spawn s1, then *replace* this
+// process with `claude` so window 0 stays alive as the master session.
+func insideTmux(projectCwd string) error {
 	sess, err := tmux.CurrentSession()
 	if err != nil {
 		return err
@@ -100,18 +125,34 @@ func runRootBootstrap(cmd *cobra.Command, args []string) error {
 		return CLIError(exitcode.InternalError, "install project hooks: %v", err)
 	}
 
-	masterLaunch := fmt.Sprintf(
-		`cd %q && claude --append-system-prompt "$(cat %q)" --dangerously-skip-permissions`,
-		projectCwd, systemPath)
-	if err := tmux.SendKeysCmd(sess, "0", masterLaunch, "Enter").Run(); err != nil {
-		return CLIError(exitcode.InternalError, "launch master: %v", err)
-	}
-
+	// Pre-spawn s1 in window 1.
 	spawnCmd := exec.Command(conductorBin, "spawn", "--name", "s1")
 	spawnCmd.Stdout = os.Stdout
 	spawnCmd.Stderr = os.Stderr
 	if err := spawnCmd.Run(); err != nil {
 		return CLIError(exitcode.InternalError, "pre-spawn s1: %v", err)
+	}
+
+	// Read system prompt into memory so we can pass it as a single argv
+	// element (avoids shell-quoting pain).
+	sysBytes, err := os.ReadFile(systemPath)
+	if err != nil {
+		return err
+	}
+
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return CLIError(exitcode.InternalError, "cannot find `claude` on PATH: %v", err)
+	}
+
+	argv := []string{
+		"claude",
+		"--append-system-prompt", string(sysBytes),
+		"--dangerously-skip-permissions",
+	}
+	// Replace the conductor process with claude. Does not return on success.
+	if err := syscall.Exec(claudePath, argv, os.Environ()); err != nil {
+		return CLIError(exitcode.InternalError, "exec claude: %v", err)
 	}
 	return nil
 }

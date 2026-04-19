@@ -49,6 +49,12 @@ func NewSessionCmd(session, command string) *exec.Cmd {
 	return exec.Command("tmux", "new-session", "-d", "-s", session, command)
 }
 
+// NewSessionCmdShell builds `tmux new-session -d -s <session>` using the
+// default shell for window 0 (no command override).
+func NewSessionCmdShell(session string) *exec.Cmd {
+	return exec.Command("tmux", "new-session", "-d", "-s", session)
+}
+
 // AttachSessionCmd builds `tmux attach-session -t <session>`.
 func AttachSessionCmd(session string) *exec.Cmd {
 	return exec.Command("tmux", "attach-session", "-t", session)
