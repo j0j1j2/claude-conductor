@@ -1,0 +1,65 @@
+# claude-conductor
+
+A master Claude Code session delegates to slave Claude Code sessions via a Go CLI, inside a shared tmux session.
+
+## What it does
+
+You give a high-level goal to the **master** Claude. The master writes prompts for **slaves** running in sibling tmux windows, reads their outputs, and decides follow-ups — all autonomously — until the goal is done.
+
+## Requirements
+
+- tmux
+- `claude` (Claude Code CLI, logged in with a Pro/Max subscription)
+- Go 1.22+ (to build)
+
+## Install
+
+```bash
+go install github.com/cloudchamb3r/claude-conductor@latest
+# or from source:
+git clone https://github.com/cloudchamb3r/claude-conductor
+cd claude-conductor
+go install ./...
+```
+
+## Usage
+
+```bash
+cd your-project
+conductor
+```
+
+A tmux session opens with:
+- Window 0: master Claude (you interact here)
+- Window 1: slave `s1` ready to receive delegated prompts
+
+Give the master your goal in plain language.
+
+## Subcommands (used by the master, not you directly)
+
+```
+conductor spawn [--name sN]              # new slave
+conductor send [--timeout S] <id> <msg>  # send prompt, block on completion
+conductor interrupt <id>                 # cancel current turn (Escape)
+conductor reset <id>                     # fresh slave in same window
+conductor kill <id>                      # close window + clean up
+conductor list                           # active slaves
+conductor last <id>                      # print slave's last response
+```
+
+## Design
+
+See [`docs/superpowers/specs/2026-04-19-claude-conductor-design.md`](docs/superpowers/specs/2026-04-19-claude-conductor-design.md) for the full design.
+
+## Development
+
+```bash
+go test ./...        # unit tests
+go build ./...       # build
+```
+
+Manual smoke test: [`docs/manual-smoketest.md`](docs/manual-smoketest.md).
+
+## License
+
+MIT
