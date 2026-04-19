@@ -19,6 +19,14 @@ func SendKeysCmd(session, window string, keys ...string) *exec.Cmd {
 	return exec.Command("tmux", args...)
 }
 
+// SendLiteralCmd builds `tmux send-keys -l -t <session>:<window> <text>`.
+// The -l flag forces the text to be treated as literal keystrokes, bypassing
+// tmux's key-name interpretation. This is the safe way to type arbitrary text
+// (including multi-line prompts) into a TUI running inside the pane.
+func SendLiteralCmd(session, window, text string) *exec.Cmd {
+	return exec.Command("tmux", "send-keys", "-l", "-t", session+":"+window, text)
+}
+
 // LoadBufferCmd builds `tmux load-buffer <file>`.
 func LoadBufferCmd(path string) *exec.Cmd {
 	return exec.Command("tmux", "load-buffer", path)

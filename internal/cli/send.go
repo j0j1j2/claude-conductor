@@ -59,22 +59,14 @@ var sendCmd = &cobra.Command{
 			return err
 		}
 
-		promptFile, err := os.CreateTemp("", "conductor-prompt-*.txt")
-		if err != nil {
-			return err
+		// Type the prompt as literal keystrokes into the slave's TUI.
+		// paste-buffer does not reliably land in Claude Code's Ink-based
+		// input widget; `send-keys -l` simulates actual typing instead.
+		if err := tmux.SendLiteralCmd(sess, id, prompt).Run(); err != nil {
+			return CLIError(exitcode.InternalError, "tmux send-keys -l: %v", err)
 		}
-		defer os.Remove(promptFile.Name())
-		if _, err := promptFile.WriteString(prompt); err != nil {
-			return err
-		}
-		promptFile.Close()
-
-		if err := tmux.LoadBufferCmd(promptFile.Name()).Run(); err != nil {
-			return CLIError(exitcode.InternalError, "tmux load-buffer: %v", err)
-		}
-		if err := tmux.PasteBufferCmd(sess, id).Run(); err != nil {
-			return CLIError(exitcode.InternalError, "tmux paste-buffer: %v", err)
-		}
+		// Brief pause so the TUI processes the input buffer before submit.
+		time.Sleep(100 * time.Millisecond)
 		if err := tmux.SendKeysCmd(sess, id, "Enter").Run(); err != nil {
 			return CLIError(exitcode.InternalError, "tmux send-keys Enter: %v", err)
 		}
