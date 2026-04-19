@@ -77,6 +77,13 @@ func outsideTmux(projectCwd string) error {
 		return att.Run()
 	}
 
+	// The tmux session does not exist. Any state left in
+	// ~/.conductor/sessions/<sessionName>/ is from a prior, now-dead run;
+	// remove it so the fresh session starts with a clean slate of slaves.
+	if err := os.RemoveAll(state.SessionDir(sessionName)); err != nil {
+		return CLIError(exitcode.InternalError, "clean stale state dir: %v", err)
+	}
+
 	// Create session with the default shell in window 0 (NOT conductor —
 	// if we ran the conductor binary directly as the pane process, window 0
 	// would close as soon as this function returned).
