@@ -43,6 +43,19 @@ var spawnCmd = &cobra.Command{
 		if err := os.MkdirAll(slaveDir, 0o755); err != nil {
 			return err
 		}
+		// If anything below fails, tear down the half-built slave so
+		// the next attempt is not blocked by leftover files / window.
+		windowCreated := false
+		spawnSucceeded := false
+		defer func() {
+			if spawnSucceeded {
+				return
+			}
+			if windowCreated {
+				_ = tmux.KillWindowCmd(sess, id).Run()
+			}
+			_ = os.RemoveAll(slaveDir)
+		}()
 
 		conductorBin, err := os.Executable()
 		if err != nil {
@@ -76,9 +89,11 @@ var spawnCmd = &cobra.Command{
 		if err := tmux.NewWindowCmd(sess, id, runShPath).Run(); err != nil {
 			return CLIError(exitcode.InternalError, "tmux new-window: %v", err)
 		}
+		windowCreated = true
 
 		readyPath := filepath.Join(slaveDir, ".ready")
 		if _, err := os.Stat(readyPath); err == nil {
+			spawnSucceeded = true
 			fmt.Println(id)
 			return nil
 		}
@@ -87,6 +102,7 @@ var spawnCmd = &cobra.Command{
 			select {
 			case ev := <-w.Events:
 				if ev.Op&fsnotify.Create == fsnotify.Create && filepath.Base(ev.Name) == ".ready" {
+					spawnSucceeded = true
 					fmt.Println(id)
 					return nil
 				}

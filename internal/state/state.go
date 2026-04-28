@@ -70,6 +70,16 @@ func writePending(pendingPath string) error {
 	return f.Close()
 }
 
+// IsBusy reports whether the slave currently holds a live .pending lock.
+// A .pending file is considered NOT busy if (a) a sibling .done exists, or
+// (b) the PID written into .pending is no longer alive.
+func IsBusy(slaveDir string) bool {
+	if _, err := os.Stat(filepath.Join(slaveDir, ".pending")); err != nil {
+		return false
+	}
+	return !isPendingStale(slaveDir)
+}
+
 // isPendingStale reports whether an existing .pending lock is no longer
 // meaningful (slave already finished, or the holder process is gone).
 func isPendingStale(slaveDir string) bool {

@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
 	"github.com/j0j1j2/claude-conductor/internal/state"
@@ -35,7 +34,7 @@ var listCmd = &cobra.Command{
 			}
 			id := e.Name()
 			st := "idle"
-			if _, err := os.Stat(filepath.Join(state.SlaveDir(sess, id), ".pending")); err == nil {
+			if state.IsBusy(state.SlaveDir(sess, id)) {
 				st = "busy"
 			}
 			fmt.Printf("%s\t%s\n", id, st)
