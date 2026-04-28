@@ -103,7 +103,10 @@ var sendCmd = &cobra.Command{
 				}
 			case <-deadline:
 				_ = state.RemovePending(slaveDir)
-				return CLIError(exitcode.Timeout, "slave %s did not complete within %ds (may still be working; use `conductor interrupt %s`)", id, sendTimeout, id)
+				diag := Diagnose(sess, id).Summary()
+				return CLIError(exitcode.Timeout,
+					"slave %s did not complete within %ds\n  diagnostics: %s\n  hint: `conductor doctor %s` for full report; `conductor interrupt %s` to cancel",
+					id, sendTimeout, diag, id, id)
 			}
 		}
 	},

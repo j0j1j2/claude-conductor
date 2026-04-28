@@ -2,6 +2,7 @@
 package tmux
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -92,6 +93,17 @@ func PaneDead(session, window string) (bool, error) {
 		return false, err
 	}
 	return parsePaneDead(string(out)), nil
+}
+
+// CapturePane returns the last n lines of the given window's pane buffer.
+func CapturePane(session, window string, n int) (string, error) {
+	out, err := exec.Command("tmux", "capture-pane",
+		"-p", "-t", session+":"+window,
+		"-S", fmt.Sprintf("-%d", n)).Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func parsePaneDead(s string) bool {
