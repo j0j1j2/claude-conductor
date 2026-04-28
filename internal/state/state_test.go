@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,6 +39,8 @@ func TestCreatePending_exclusive(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// First create succeeds; lock holds our PID, so a second call from the
+	// same process is treated as live and rejected.
 	if err := CreatePending(slaveDir); err != nil {
 		t.Fatalf("first CreatePending failed: %v", err)
 	}
@@ -50,6 +53,42 @@ func TestCreatePending_exclusive(t *testing.T) {
 	}
 	if err := CreatePending(slaveDir); err != nil {
 		t.Fatalf("CreatePending after remove failed: %v", err)
+	}
+}
+
+func TestCreatePending_stalePidIsCleared(t *testing.T) {
+	tempHome(t)
+	slaveDir := SlaveDir("s", "s1")
+	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a .pending whose PID is essentially never alive.
+	if err := os.WriteFile(filepath.Join(slaveDir, ".pending"), []byte("999999999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreatePending(slaveDir); err != nil {
+		t.Fatalf("CreatePending should clear stale PID lock, got: %v", err)
+	}
+}
+
+func TestCreatePending_doneOverridesBusy(t *testing.T) {
+	tempHome(t)
+	slaveDir := SlaveDir("s", "s1")
+	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a .pending naming this very process (so the PID check would
+	// otherwise consider it live), AND a .done. A finished turn means the
+	// slave is idle, so the lock must be treated as stale.
+	if err := os.WriteFile(filepath.Join(slaveDir, ".pending"),
+		[]byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(slaveDir, ".done"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreatePending(slaveDir); err != nil {
+		t.Fatalf("CreatePending should override busy when .done exists, got: %v", err)
 	}
 }
 

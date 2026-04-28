@@ -3,11 +3,15 @@ package state
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 )
 
-// ErrBusy means a .pending file already exists for the slave.
+// ErrBusy means a live .pending lock blocks a new send.
 var ErrBusy = errors.New("state: slave is busy")
 
 // RootDir returns ~/.conductor.
@@ -32,17 +36,60 @@ func SlaveExists(session, id string) bool {
 	return err == nil
 }
 
-// CreatePending creates the `.pending` file exclusively. Returns ErrBusy if
-// the file already exists.
+// CreatePending creates the `.pending` file exclusively, recording the
+// current process's PID inside it. If the file already exists, the lock is
+// validated:
+//   - A `.done` sitting next to it means the slave already finished — the
+//     lock is stale (probably a previous send that was interrupted before
+//     it could clean up). Replace and continue.
+//   - The recorded PID is no longer alive — the lock is stale (the previous
+//     conductor process crashed or was killed). Replace and continue.
+//   - Otherwise the lock is live → ErrBusy.
 func CreatePending(slaveDir string) error {
-	f, err := os.OpenFile(filepath.Join(slaveDir, ".pending"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		if os.IsExist(err) {
-			return ErrBusy
-		}
+	pendingPath := filepath.Join(slaveDir, ".pending")
+	if err := writePending(pendingPath); err == nil {
+		return nil
+	} else if !os.IsExist(err) {
 		return err
 	}
+
+	if !isPendingStale(slaveDir) {
+		return ErrBusy
+	}
+	// Stale lock: replace it.
+	_ = os.Remove(pendingPath)
+	return writePending(pendingPath)
+}
+
+func writePending(pendingPath string) error {
+	f, err := os.OpenFile(pendingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 	return f.Close()
+}
+
+// isPendingStale reports whether an existing .pending lock is no longer
+// meaningful (slave already finished, or the holder process is gone).
+func isPendingStale(slaveDir string) bool {
+	if _, err := os.Stat(filepath.Join(slaveDir, ".done")); err == nil {
+		return true
+	}
+	b, err := os.ReadFile(filepath.Join(slaveDir, ".pending"))
+	if err != nil {
+		return true
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return true
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	// Signal 0 probes for process existence without delivering anything.
+	return proc.Signal(syscall.Signal(0)) != nil
 }
 
 // RemovePending removes the `.pending` file. No error if it does not exist.

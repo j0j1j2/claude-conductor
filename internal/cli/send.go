@@ -90,12 +90,19 @@ var sendCmd = &cobra.Command{
 			case err := <-w.Errors:
 				return err
 			case <-liveness.C:
+				// Belt-and-suspenders poll: fsnotify can drop or coalesce
+				// events under load, leaving us blocked even though the
+				// slave already wrote .done.
+				if _, err := os.Stat(donePath); err == nil {
+					return finishSend(slaveDir)
+				}
 				dead, _ := tmux.PaneDead(sess, id)
 				if dead {
 					_ = state.RemovePending(slaveDir)
 					return CLIError(exitcode.Crash, "slave %s window is dead", id)
 				}
 			case <-deadline:
+				_ = state.RemovePending(slaveDir)
 				return CLIError(exitcode.Timeout, "slave %s did not complete within %ds (may still be working; use `conductor interrupt %s`)", id, sendTimeout, id)
 			}
 		}
