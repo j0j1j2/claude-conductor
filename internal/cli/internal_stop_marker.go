@@ -54,9 +54,17 @@ var internalStopMarkerCmd = &cobra.Command{
 		}
 
 		// Update the sticky transcript-path file on every fire so the NEXT
-		// `conductor send` can compute a meaningful watermark. Best-effort.
+		// `conductor send` has a current path to stat. Best-effort.
 		if hookIn.TranscriptPath != "" {
 			_ = state.WriteTranscriptPath(slaveDir, hookIn.TranscriptPath)
+		}
+
+		// Suspicious hook stdin (missing transcript path) — refuse to deliver.
+		// The orphan-log path is safer than writing a hook-error sentinel that
+		// would propagate to a (possibly innocent) send's stdout.
+		if hookIn.TranscriptPath == "" {
+			logOrphanHook(slaveDir, hookIn.SessionID, "hook stdin missing transcript_path")
+			return nil
 		}
 
 		// No active .pending → no `conductor send` is waiting for this turn.
@@ -65,23 +73,37 @@ var internalStopMarkerCmd = &cobra.Command{
 			logOrphanHook(slaveDir, hookIn.SessionID, "no .pending lock present")
 			return nil
 		}
+
+		// Drain in progress → reject. The send has acquired the lock but has
+		// not yet injected its new prompt; any transcript content visible
+		// right now belongs to a prior or cancelled turn.
+		if lock.Draining {
+			logOrphanHook(slaveDir, hookIn.SessionID,
+				fmt.Sprintf("send for turn=%s is in drain phase; refusing to deliver pre-prompt content", lock.TurnID))
+			return nil
+		}
+
 		turnID := lock.TurnID
 
-		// Transcript watermark check: if the send recorded a path + offset and
-		// the path matches and the file has NOT grown beyond the offset, this
-		// hook was queued before our prompt was processed — the transcript
-		// text we'd deliver would belong to the prior turn. Reject.
-		if lock.TranscriptPath != "" && lock.TranscriptPath == hookIn.TranscriptPath {
+		// Watermark gate: if the send recorded a transcript path that names
+		// the SAME inode as the hook's current transcript, and the file has
+		// not grown past the offset, this hook fired for content that
+		// pre-dates our prompt and must be refused. A file that has SHRUNK
+		// past the offset is treated as compaction (Claude's /compact) or
+		// rotation — accept and let TurnID matching do the work.
+		if lock.TranscriptPath != "" && sameFile(lock.TranscriptPath, hookIn.TranscriptPath) {
 			if fi, statErr := os.Stat(hookIn.TranscriptPath); statErr == nil {
-				if fi.Size() <= lock.TranscriptOffset {
-					// Stale Stop hook for a prior turn. Don't write .done; the
-					// send loop will keep waiting and the slave's NEXT Stop
-					// hook (for the new turn) will deliver. Log forensically.
+				switch {
+				case fi.Size() < lock.TranscriptOffset:
+					// File shrank — compaction/rotation. Accept.
+				case fi.Size() == lock.TranscriptOffset:
+					// Identical byte count: no new content. Stale.
 					logOrphanHook(slaveDir, hookIn.SessionID,
-						fmt.Sprintf("stale hook: transcript size %d <= watermark %d (path %s)",
-							fi.Size(), lock.TranscriptOffset, hookIn.TranscriptPath))
+						fmt.Sprintf("stale hook: transcript size %d == watermark %d (path %s, turn=%s)",
+							fi.Size(), lock.TranscriptOffset, hookIn.TranscriptPath, turnID))
 					return nil
 				}
+				// size > offset → fall through, deliver.
 			}
 		}
 
@@ -99,9 +121,18 @@ var internalStopMarkerCmd = &cobra.Command{
 			return werr
 		}
 
-		summary := fmt.Sprintf("%s | turn=%s ended | %d bytes | watermark=%d | size=%s | session=%s\n",
+		gateState := "skipped(no watermark)"
+		if lock.TranscriptPath != "" {
+			if sameFile(lock.TranscriptPath, hookIn.TranscriptPath) {
+				gateState = "enforced"
+			} else {
+				gateState = "skipped(path mismatch)"
+			}
+		}
+		summary := fmt.Sprintf(
+			"%s | turn=%s ended | %d bytes | watermark=%d | gate=%s | size=%s | session=%s\n",
 			time.Now().UTC().Format(time.RFC3339), turnID, len(text),
-			lock.TranscriptOffset, statSize(hookIn.TranscriptPath), hookIn.SessionID)
+			lock.TranscriptOffset, gateState, statSize(hookIn.TranscriptPath), hookIn.SessionID)
 		f, err := os.OpenFile(filepath.Join(slaveDir, "transcript.log"),
 			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err == nil {
@@ -110,6 +141,24 @@ var internalStopMarkerCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// sameFile compares two filesystem paths via os.SameFile so that symlink
+// aliases, /private/var ↔ /var on macOS, and similar do not silently
+// disable the watermark gate.
+func sameFile(a, b string) bool {
+	if a == b {
+		return true
+	}
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fa, fb)
 }
 
 func statSize(path string) string {

@@ -21,18 +21,22 @@ type SlaveDiagnosis struct {
 	SlaveDir    string
 	WindowAlive bool
 
-	HasReady    bool
-	ReadyAt     time.Time
-	HasPending  bool
-	PendingAt   time.Time
-	PendingPID  int
-	PendingTurn string
-	PIDAlive    bool
-	HasDone     bool
-	DoneAt      time.Time
-	DoneTurn    string
-	HasExit     bool
-	ExitCode    string
+	HasReady              bool
+	ReadyAt               time.Time
+	HasPending            bool
+	PendingAt             time.Time
+	PendingPID            int
+	PendingTurn           string
+	PendingDraining       bool
+	PendingTranscriptPath string
+	PendingOffset         int64
+	StickyTranscriptPath  string
+	PIDAlive              bool
+	HasDone               bool
+	DoneAt                time.Time
+	DoneTurn              string
+	HasExit               bool
+	ExitCode              string
 
 	HookCommands []string // every Stop-hook command found in settings.local.json
 	PaneTail     string   // last few lines of the slave's tmux pane
@@ -61,6 +65,9 @@ func Diagnose(session, id string) SlaveDiagnosis {
 		if lock, lerr := state.ReadPending(d.SlaveDir); lerr == nil {
 			d.PendingPID = lock.PID
 			d.PendingTurn = lock.TurnID
+			d.PendingDraining = lock.Draining
+			d.PendingTranscriptPath = lock.TranscriptPath
+			d.PendingOffset = lock.TranscriptOffset
 			if lock.PID > 0 {
 				if proc, perr := os.FindProcess(lock.PID); perr == nil {
 					d.PIDAlive = proc.Signal(syscall.Signal(0)) == nil
@@ -79,6 +86,7 @@ func Diagnose(session, id string) SlaveDiagnosis {
 		d.HasExit = true
 		d.ExitCode = strings.TrimSpace(string(b))
 	}
+	d.StickyTranscriptPath = state.ReadTranscriptPath(d.SlaveDir)
 	d.HookCommands = readStopHookCommands(projectCwdFromSession(session))
 	if pane, err := tmux.CapturePane(session, id, 12); err == nil {
 		d.PaneTail = strings.TrimRight(pane, "\n ")
@@ -185,13 +193,23 @@ func (d SlaveDiagnosis) Full() string {
 	fmt.Fprintf(&b, "  .pending:   %s", fileLine(d.HasPending, d.PendingAt))
 	if d.HasPending {
 		if d.PendingPID > 0 {
-			fmt.Fprintf(&b, " (pid %d %s, turn=%s)\n",
+			fmt.Fprintf(&b, " (pid %d %s, turn=%s",
 				d.PendingPID, boolWord(d.PIDAlive, "alive", "STALE"), d.PendingTurn)
+			if d.PendingDraining {
+				fmt.Fprint(&b, ", DRAINING")
+			}
+			if d.PendingTranscriptPath != "" {
+				fmt.Fprintf(&b, ", watermark=%d on %s", d.PendingOffset, d.PendingTranscriptPath)
+			}
+			fmt.Fprintln(&b, ")")
 		} else {
-			fmt.Fprintf(&b, " (no pid recorded)\n")
+			fmt.Fprintln(&b, " (no pid recorded)")
 		}
 	} else {
 		fmt.Fprintln(&b)
+	}
+	if d.StickyTranscriptPath != "" {
+		fmt.Fprintf(&b, "  sticky:     %s\n", d.StickyTranscriptPath)
 	}
 	fmt.Fprintf(&b, "  .done:      %s", fileLine(d.HasDone, d.DoneAt))
 	if d.HasDone && d.DoneTurn != "" {

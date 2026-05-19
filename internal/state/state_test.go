@@ -2,7 +2,6 @@ package state
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,13 +157,13 @@ func TestReadDone_legacyOrMalformedHasEmptyTurnID(t *testing.T) {
 	}
 }
 
-func TestCreatePendingWithWatermark_roundTrip(t *testing.T) {
+func TestCreatePending_startsInDrainingState(t *testing.T) {
 	tempHome(t)
 	slaveDir := SlaveDir("s", "s1")
 	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	turnID, err := CreatePendingWithWatermark(slaveDir, "/tmp/transcript.jsonl", 12345)
+	turnID, err := CreatePending(slaveDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,14 +174,54 @@ func TestCreatePendingWithWatermark_roundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lock.TranscriptPath != "/tmp/transcript.jsonl" {
-		t.Errorf("transcript path round-trip: got %q", lock.TranscriptPath)
+	if !lock.Draining {
+		t.Error("CreatePending should start the lock in Draining=true state")
 	}
-	if lock.TranscriptOffset != 12345 {
-		t.Errorf("transcript offset round-trip: got %d", lock.TranscriptOffset)
+	if lock.TranscriptPath != "" || lock.TranscriptOffset != 0 {
+		t.Errorf("expected no watermark on fresh lock, got path=%q offset=%d",
+			lock.TranscriptPath, lock.TranscriptOffset)
+	}
+}
+
+func TestFinalizePendingWatermark(t *testing.T) {
+	tempHome(t)
+	slaveDir := SlaveDir("s", "s1")
+	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	turnID, err := CreatePending(slaveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := FinalizePendingWatermark(slaveDir, turnID, "/tmp/t.jsonl", 4096); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := ReadPending(slaveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Draining {
+		t.Error("Finalize should clear Draining flag")
+	}
+	if lock.TranscriptPath != "/tmp/t.jsonl" || lock.TranscriptOffset != 4096 {
+		t.Errorf("watermark not stamped: %+v", lock)
 	}
 	if lock.TurnID != turnID {
-		t.Errorf("turn id mismatch")
+		t.Error("turn id changed across finalize")
+	}
+}
+
+func TestFinalizePendingWatermark_rejectsForeignTurn(t *testing.T) {
+	tempHome(t)
+	slaveDir := SlaveDir("s", "s1")
+	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreatePending(slaveDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := FinalizePendingWatermark(slaveDir, "not-our-turn-id", "/t", 1); err == nil {
+		t.Error("expected error when turn id does not match")
 	}
 }
 
@@ -223,5 +262,3 @@ func TestSlaveExists(t *testing.T) {
 	}
 }
 
-// silence go vet about unused import
-var _ = fmt.Sprintf

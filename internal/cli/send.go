@@ -62,16 +62,13 @@ var sendCmd = &cobra.Command{
 		}
 		slaveDir := state.SlaveDir(sess, id)
 
-		// Compute the transcript watermark: the slave's claude transcript
-		// path (recorded by the most recent Stop hook) and its current size.
-		// A delayed prior-turn hook firing after we acquire the lock will be
-		// rejected if the transcript hasn't grown past this offset.
-		transcriptPath, transcriptOffset := readTranscriptWatermark(slaveDir)
-
-		// Acquire a turn-id'd lock BEFORE doing anything observable to the
-		// slave; concurrent senders thus fan out into busy/ok without racing
-		// on shared keystrokes.
-		turnID, err := state.CreatePendingWithWatermark(slaveDir, transcriptPath, transcriptOffset)
+		// Acquire a turn-id'd lock in DRAINING state. Until we finalize the
+		// watermark below, the Stop hook refuses to write .done. This guards
+		// the race where the Escape we are about to send causes claude to
+		// commit the cancelled prior turn's text to the transcript — that
+		// content would otherwise look like a legitimate post-watermark
+		// response and be tagged with our turn id.
+		turnID, err := state.CreatePending(slaveDir)
 		if err != nil {
 			if errors.Is(err, state.ErrBusy) {
 				return CLIError(exitcode.Busy, "slave %s is busy", id)
@@ -85,13 +82,21 @@ var sendCmd = &cobra.Command{
 			}
 		}()
 
-		// Drain phase (now under the lock): interrupt any in-flight prior
-		// turn and let its Stop hook land before we clear .done. Only the
-		// winner of the lock pays this cost.
+		// Drain phase (under the lock + Draining flag): interrupt any
+		// in-flight prior turn. Any Stop hook firing now sees Draining=true
+		// and refuses to deliver. Only the winner of contention pays this
+		// cancellation cost.
 		_ = tmux.SendKeysCmd(sess, id, "Escape").Run()
 		time.Sleep(300 * time.Millisecond)
 		if err := state.RemoveDone(slaveDir); err != nil {
 			return CLIError(exitcode.InternalError, "clear stale .done: %v", err)
+		}
+
+		// NOW stat the transcript: its size at this moment is the watermark.
+		// Lift Draining atomically by rewriting .pending with the watermark.
+		transcriptPath, transcriptOffset := readTranscriptWatermark(slaveDir)
+		if err := state.FinalizePendingWatermark(slaveDir, turnID, transcriptPath, transcriptOffset); err != nil {
+			return CLIError(exitcode.InternalError, "finalize watermark: %v", err)
 		}
 
 		w, err := fsnotify.NewWatcher()
@@ -244,8 +249,10 @@ func tryFinishV(slaveDir, turnID string) (exit int, err error, mismatched bool) 
 // readTranscriptWatermark resolves the slave's current transcript path and
 // stats it for a size, to use as a "drop everything before this offset"
 // barrier for the Stop hook. Both values may be empty/zero when no transcript
-// path has been recorded yet (e.g. very first send, or right after reset);
-// the Stop hook then falls back to legacy behavior for this one turn.
+// path has been recorded yet (e.g. very first send, or right after reset),
+// OR when the path is recorded but unreadable (we fail closed — return
+// empty path so the hook gate is explicitly disabled rather than silently
+// neutered by a path-set + offset=0).
 func readTranscriptWatermark(slaveDir string) (string, int64) {
 	path := state.ReadTranscriptPath(slaveDir)
 	if path == "" {
@@ -253,7 +260,9 @@ func readTranscriptWatermark(slaveDir string) (string, int64) {
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
-		return path, 0
+		// Disable watermarking explicitly rather than recording a 0 offset
+		// that every subsequent hook would trivially pass.
+		return "", 0
 	}
 	return path, fi.Size()
 }

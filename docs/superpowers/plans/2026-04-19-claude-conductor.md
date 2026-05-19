@@ -1,5 +1,14 @@
 # claude-conductor Implementation Plan
 
+> ⚠️ **HISTORICAL — DO NOT FOLLOW BLINDLY.** This plan was authored before
+> several rounds of bug-fix iteration. In particular, code snippets in this
+> file still reference `CLAUDE_CONFIG_DIR` (removed in commit `fbe3c09`),
+> a 2-arg `state.CreatePending`/`state.WriteDone` (superseded by the
+> turn-id and watermark protocols), and an `exec claude` line in `run.sh`
+> (replaced because `exec` drops the EXIT trap and `.exit-code` was never
+> written). For the current behavior consult the source — `internal/cli/`
+> and `internal/hooks/`. This plan remains here for posterity.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a Go CLI `conductor` that lets a master Claude Code session delegate work to slave Claude Code sessions running in sibling tmux windows, with sync-blocking `send` via Stop-hook file markers.

@@ -40,7 +40,10 @@ var resetCmd = &cobra.Command{
 				"slave %s is busy; use `conductor interrupt %s` first, or pass --force", id, id)
 		}
 
-		for _, f := range []string{".pending", ".done", ".ready", ".exit-code", ".ready-error"} {
+		// Reset wipes ALL transient slave state, including the sticky
+		// transcript-path file: the relaunched claude will open a new
+		// transcript and the next send must observe that fresh path.
+		for _, f := range []string{".pending", ".done", ".ready", ".exit-code", ".ready-error", "transcript-path"} {
 			_ = os.Remove(filepath.Join(slaveDir, f))
 		}
 

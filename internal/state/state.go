@@ -82,20 +82,25 @@ func SlaveExists(session, id string) bool {
 
 // PendingLock is the structured content of a .pending file.
 //
-// TurnID alone is insufficient to discriminate prior-turn stragglers: a
-// delayed Stop hook reads whatever .pending happens to be on disk and would
-// stamp its (prior-turn) transcript text with our (new) turn id. To close
-// that race, the lock also embeds a "transcript watermark": the path of the
-// slave's claude transcript file and the byte offset that file had when the
-// send acquired the lock. The Stop hook compares its current transcript path
-// and size against this watermark; if the path matches and the size has not
-// grown past the offset, the hook is firing for content that pre-dates the
-// new prompt and must NOT be delivered.
+// Race model:
+//   - TurnID lets the Stop hook tag .done so concurrent sends never collide
+//     on identifying which turn finished.
+//   - TranscriptPath + TranscriptOffset is the "watermark": the byte size of
+//     the slave's claude transcript at the moment the send was ready to
+//     inject the new prompt. A hook whose transcript size has NOT grown
+//     past the offset is firing for content that pre-dates the new prompt
+//     and is refused.
+//   - Draining = true means the send has acquired the lock but has not yet
+//     stamped a real watermark (it is currently sending Escape and waiting
+//     for the prior turn's hook to land). All hook fires during this window
+//     are rejected: they cannot belong to the new prompt because the new
+//     prompt has not been injected yet.
 type PendingLock struct {
 	PID              int    `json:"pid"`
 	TurnID           string `json:"turn_id"`
 	TranscriptPath   string `json:"transcript_path,omitempty"`
-	TranscriptOffset int64  `json:"transcript_offset,omitempty"`
+	TranscriptOffset int64  `json:"transcript_offset"`
+	Draining         bool   `json:"draining,omitempty"`
 }
 
 // NewTurnID returns a fresh per-send identifier.
@@ -105,25 +110,19 @@ func NewTurnID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// CreatePending creates the `.pending` file exclusively, recording PID and a
-// fresh TurnID. Watermark fields are unset; suitable for the first send when
-// no transcript path is known yet. See CreatePendingWithWatermark for the
-// race-tight variant.
-func CreatePending(slaveDir string) (string, error) {
-	return CreatePendingWithWatermark(slaveDir, "", 0)
-}
-
-// CreatePendingWithWatermark creates a `.pending` file with a transcript
-// watermark embedded. The Stop hook honors the watermark to reject delayed
-// prior-turn hooks. On contention the existing lock is validated:
+// CreatePending creates the `.pending` file in DRAINING state (Draining=true,
+// no real watermark yet). The send must subsequently call
+// FinalizePendingWatermark after its drain phase completes to lift the
+// drain flag and stamp the real watermark.
+//
+// On contention the existing lock is validated:
 //   - The recorded PID is no longer alive → stale, take over.
 //   - Otherwise the lock is live → ErrBusy.
-func CreatePendingWithWatermark(slaveDir, transcriptPath string, transcriptOffset int64) (string, error) {
+func CreatePending(slaveDir string) (string, error) {
 	lock := PendingLock{
-		PID:              os.Getpid(),
-		TurnID:           NewTurnID(),
-		TranscriptPath:   transcriptPath,
-		TranscriptOffset: transcriptOffset,
+		PID:      os.Getpid(),
+		TurnID:   NewTurnID(),
+		Draining: true,
 	}
 	if err := writePending(slaveDir, lock); err == nil {
 		return lock.TurnID, nil
@@ -139,6 +138,32 @@ func CreatePendingWithWatermark(slaveDir, transcriptPath string, transcriptOffse
 		return "", err
 	}
 	return lock.TurnID, nil
+}
+
+// FinalizePendingWatermark rewrites the existing `.pending` to lift the
+// Draining flag and stamp the real transcript watermark. The caller must
+// still own the lock (matching PID and TurnID); otherwise we error rather
+// than silently corrupt a peer's state.
+//
+// transcriptPath may be empty if no sticky path has been observed yet — in
+// that case the resulting lock allows the next Stop hook to deliver via the
+// legacy path-mismatch fallback (acceptable for the first send of a
+// session).
+func FinalizePendingWatermark(slaveDir, turnID, transcriptPath string, transcriptOffset int64) error {
+	lock, err := ReadPending(slaveDir)
+	if err != nil {
+		return err
+	}
+	if lock.TurnID != turnID {
+		return fmt.Errorf("pending lock has turn id %q, expected %q (concurrent overwrite?)", lock.TurnID, turnID)
+	}
+	if lock.PID != os.Getpid() {
+		return fmt.Errorf("pending lock held by pid %d, not us (%d)", lock.PID, os.Getpid())
+	}
+	lock.TranscriptPath = transcriptPath
+	lock.TranscriptOffset = transcriptOffset
+	lock.Draining = false
+	return writePendingForce(slaveDir, lock)
 }
 
 // TranscriptPathFile is the sticky file inside a slave's state dir that
