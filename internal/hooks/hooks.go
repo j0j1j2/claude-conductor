@@ -61,7 +61,7 @@ func RenderProjectSettings(conductorBin string) string {
 func RenderRunScript(slaveDir, projectCwd, slaveID string) string {
 	return fmt.Sprintf(`#!/usr/bin/env bash
 export CONDUCTOR_SLAVE_ID=%s
-cd %s
+cd %s || { echo 97 > %s; exit 97; }
 claude --dangerously-skip-permissions
 ec=$?
 echo "$ec" > %s
@@ -69,6 +69,7 @@ exit "$ec"
 `,
 		ShellQuote(slaveID),
 		ShellQuote(projectCwd),
+		ShellQuote(slaveDir+"/.exit-code"),
 		ShellQuote(slaveDir+"/.exit-code"),
 	)
 }

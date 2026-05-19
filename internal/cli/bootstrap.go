@@ -74,8 +74,20 @@ func outsideTmux(projectCwd string) error {
 		return CLIError(exitcode.InternalError, "os.Executable: %v", err)
 	}
 
-	// If session already exists, just attach.
+	if _, lerr := exec.LookPath("tmux"); lerr != nil {
+		return CLIError(exitcode.InternalError, "tmux is required but not found on PATH: %v", lerr)
+	}
+
+	// If session already exists, verify it's actually conductor-managed
+	// before attaching, so we don't drop the user into a foreign tmux
+	// session with a hash-colliding name.
 	if tmux.HasSessionCmd(sessionName).Run() == nil {
+		sessionFile := filepath.Join(state.SessionDir(sessionName), "session.json")
+		if _, sErr := os.Stat(sessionFile); sErr != nil {
+			return CLIError(exitcode.InternalError,
+				"tmux session %q exists but %s is missing; not attaching (use `tmux kill-session -t %s` if you want a fresh conductor)",
+				sessionName, sessionFile, sessionName)
+		}
 		att := tmux.AttachSessionCmd(sessionName)
 		att.Stdin, att.Stdout, att.Stderr = os.Stdin, os.Stdout, os.Stderr
 		return att.Run()
@@ -122,14 +134,14 @@ func sessionNameFromCwd(cwd string) string {
 	return fmt.Sprintf("conductor-%s-%s", base, hex.EncodeToString(sum[:3]))
 }
 
-// scrubbedEnv returns os.Environ() minus any CONDUCTOR_SLAVE_ID entry so the
-// master claude does not inherit a slave gate from the user's shell. Without
-// this scrub, the master's own Stop hook could fire and corrupt slave state.
+// scrubbedEnv returns os.Environ() minus any CONDUCTOR_* entry so the master
+// claude (and any subprocess it spawns) does not inherit a slave gate from
+// the user's shell, and so future internal env vars are protected by default.
 func scrubbedEnv() []string {
 	in := os.Environ()
 	out := make([]string, 0, len(in))
 	for _, kv := range in {
-		if strings.HasPrefix(kv, "CONDUCTOR_SLAVE_ID=") {
+		if strings.HasPrefix(kv, "CONDUCTOR_") {
 			continue
 		}
 		out = append(out, kv)

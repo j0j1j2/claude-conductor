@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/j0j1j2/claude-conductor/internal/audit"
@@ -57,6 +58,47 @@ func (e *ExitError) Error() string { return e.Msg }
 func CLIError(code int, format string, a ...any) error {
 	return &ExitError{Code: code, Msg: fmt.Sprintf(format, a...)}
 }
+
+// versionCmd prints build metadata from runtime/debug.ReadBuildInfo so users
+// can answer "what conductor am I running" without us cutting tags.
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print conductor version and build info",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		info, ok := debug.ReadBuildInfo()
+		if !ok {
+			fmt.Println("conductor (build info unavailable)")
+			return nil
+		}
+		var rev, modified, when string
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				modified = s.Value
+			case "vcs.time":
+				when = s.Value
+			}
+		}
+		fmt.Printf("conductor %s\n", info.Main.Version)
+		if rev != "" {
+			short := rev
+			if len(short) > 12 {
+				short = short[:12]
+			}
+			suffix := ""
+			if modified == "true" {
+				suffix = " (dirty)"
+			}
+			fmt.Printf("commit %s%s  %s\n", short, suffix, when)
+		}
+		fmt.Printf("go     %s\n", info.GoVersion)
+		return nil
+	},
+}
+
+func init() { Root.AddCommand(versionCmd) }
 
 // ExecuteRoot runs the root command and returns the actual executed subcommand.
 func ExecuteRoot() (*cobra.Command, error) {

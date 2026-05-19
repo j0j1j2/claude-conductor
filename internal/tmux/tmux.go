@@ -2,11 +2,13 @@
 package tmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // InTmux reports whether the process is running inside a tmux session.
@@ -84,8 +86,13 @@ func PaneDead(session, window string) (bool, error) {
 }
 
 // CapturePane returns the last n lines of the given window's pane buffer.
+// Bounded by a short context deadline so a wedged tmux server cannot hang
+// callers (especially `conductor doctor` and the timeout-diagnostics path
+// in `conductor send`).
 func CapturePane(session, window string, n int) (string, error) {
-	out, err := exec.Command("tmux", "capture-pane",
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tmux", "capture-pane",
 		"-p", "-t", session+":"+window,
 		"-S", fmt.Sprintf("-%d", n)).Output()
 	if err != nil {

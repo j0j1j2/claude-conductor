@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
@@ -18,6 +19,12 @@ var (
 	sendTimeout int
 	sendQuiet   bool
 )
+
+// hookErrSentinel marks .done content that was written by the Stop-hook's
+// error path rather than by a real assistant turn. `send` surfaces this as
+// a non-zero exit so scripts and the master Claude can tell hook failure
+// from a successful (possibly empty) response.
+const hookErrSentinel = "[conductor hook error]"
 
 var sendCmd = &cobra.Command{
 	Use:   "send <slave-id> <prompt>",
@@ -40,22 +47,24 @@ var sendCmd = &cobra.Command{
 		if sendTimeout < 1 {
 			sendTimeout = 1
 		}
+		// Refuse prompts that would let an attacker (or a misbehaving master)
+		// hijack the slave's TUI via embedded ANSI / tmux escape sequences.
+		if bad := findUnsafeControlByte(prompt); bad != "" {
+			return CLIError(exitcode.UnknownSlave,
+				"prompt contains disallowed control byte %s; strip ANSI/escape sequences", bad)
+		}
+		if strings.TrimSpace(prompt) == "" {
+			return CLIError(exitcode.UnknownSlave, "prompt is empty")
+		}
 
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
 		slaveDir := state.SlaveDir(sess, id)
 
-		// Drain phase: cancel any in-flight prior turn and wait briefly for
-		// the previous Stop hook (if any) to land. This narrows the window
-		// in which the *current* turn's Stop hook could attribute a prior
-		// turn's response to our new turn id.
-		_ = tmux.SendKeysCmd(sess, id, "Escape").Run()
-		time.Sleep(300 * time.Millisecond)
-		_ = state.RemoveDone(slaveDir)
-
-		// Acquire a turn-id'd lock so this send can later distinguish its own
-		// .done from any straggling Stop-hook completion of a prior turn.
+		// Acquire a turn-id'd lock BEFORE doing anything observable to the
+		// slave; concurrent senders thus fan out into busy/ok without racing
+		// on shared keystrokes.
 		turnID, err := state.CreatePending(slaveDir)
 		if err != nil {
 			if errors.Is(err, state.ErrBusy) {
@@ -63,8 +72,6 @@ var sendCmd = &cobra.Command{
 			}
 			return CLIError(exitcode.InternalError, "create pending lock: %v", err)
 		}
-		// Belt-and-suspenders: if we exit before finishSend (timeout, crash,
-		// pane death, validation), release the lock so the slave isn't stuck.
 		sendDone := false
 		defer func() {
 			if !sendDone {
@@ -72,6 +79,11 @@ var sendCmd = &cobra.Command{
 			}
 		}()
 
+		// Drain phase (now under the lock): interrupt any in-flight prior
+		// turn and let its Stop hook land before we clear .done. Only the
+		// winner of the lock pays this cost.
+		_ = tmux.SendKeysCmd(sess, id, "Escape").Run()
+		time.Sleep(300 * time.Millisecond)
 		if err := state.RemoveDone(slaveDir); err != nil {
 			return CLIError(exitcode.InternalError, "clear stale .done: %v", err)
 		}
@@ -94,10 +106,13 @@ var sendCmd = &cobra.Command{
 		}
 
 		donePath := filepath.Join(slaveDir, ".done")
-		if ok, ferr := tryFinish(slaveDir, turnID); ferr != nil {
+		if exit, ferr := tryFinish(slaveDir, turnID); ferr != nil {
 			return ferr
-		} else if ok {
+		} else if exit >= 0 {
 			sendDone = true
+			if exit != 0 {
+				return CLIError(exit, "slave %s reported a hook error", id)
+			}
 			return nil
 		}
 
@@ -105,8 +120,6 @@ var sendCmd = &cobra.Command{
 		liveness := time.NewTicker(1 * time.Second)
 		defer liveness.Stop()
 
-		// Track recent mismatched-turn events so we don't burn CPU if a
-		// misbehaving hook keeps rewriting the same wrong .done.
 		mismatches := 0
 		for {
 			select {
@@ -116,12 +129,15 @@ var sendCmd = &cobra.Command{
 				}
 				if ev.Op&(fsnotify.Create|fsnotify.Write) != 0 &&
 					filepath.Base(ev.Name) == ".done" {
-					okFin, ferr, matched := tryFinishV(slaveDir, turnID)
+					exit, ferr, matched := tryFinishV(slaveDir, turnID)
 					if ferr != nil {
 						return ferr
 					}
-					if okFin {
+					if exit >= 0 {
 						sendDone = true
+						if exit != 0 {
+							return CLIError(exit, "slave %s reported a hook error", id)
+						}
 						return nil
 					}
 					if !matched {
@@ -133,10 +149,6 @@ var sendCmd = &cobra.Command{
 						}
 					}
 				}
-				// Slave's state dir vanished beneath us (kill / reset midway).
-				if ev.Op&fsnotify.Remove != 0 && ev.Name == slaveDir {
-					return CLIError(exitcode.Crash, "slave %s state dir vanished (killed?)", id)
-				}
 			case werr, ok := <-w.Errors:
 				if !ok {
 					return CLIError(exitcode.InternalError, "fsnotify error channel closed")
@@ -147,10 +159,13 @@ var sendCmd = &cobra.Command{
 				return CLIError(exitcode.InternalError, "fsnotify: %v", werr)
 			case <-liveness.C:
 				if _, err := os.Stat(donePath); err == nil {
-					if okFin, ferr := tryFinish(slaveDir, turnID); ferr != nil {
+					if exit, ferr := tryFinish(slaveDir, turnID); ferr != nil {
 						return ferr
-					} else if okFin {
+					} else if exit >= 0 {
 						sendDone = true
+						if exit != 0 {
+							return CLIError(exit, "slave %s reported a hook error", id)
+						}
 						return nil
 					}
 				}
@@ -159,14 +174,14 @@ var sendCmd = &cobra.Command{
 					return CLIError(exitcode.Crash, "slave %s window is dead", id)
 				}
 			case <-deadline:
-				// Final-chance Stat: a .done arriving in the same scheduling
-				// quantum as the deadline must not be lost to select's random
-				// fairness.
 				if _, err := os.Stat(donePath); err == nil {
-					if okFin, ferr := tryFinish(slaveDir, turnID); ferr != nil {
+					if exit, ferr := tryFinish(slaveDir, turnID); ferr != nil {
 						return ferr
-					} else if okFin {
+					} else if exit >= 0 {
 						sendDone = true
+						if exit != 0 {
+							return CLIError(exit, "slave %s reported a hook error", id)
+						}
 						return nil
 					}
 				}
@@ -182,32 +197,59 @@ var sendCmd = &cobra.Command{
 	},
 }
 
-// tryFinish reads .done; if its turn id matches turnID (or is empty == legacy),
-// it consumes the .done and returns ok=true. If .done belongs to a DIFFERENT
-// turn (a prior-turn Stop hook racing us), it discards the file and keeps
-// waiting. Returns (false, nil) when .done does not yet exist.
-func tryFinish(slaveDir, turnID string) (bool, error) {
-	ok, err, _ := tryFinishV(slaveDir, turnID)
-	return ok, err
+// tryFinish wraps tryFinishV for callers that don't care whether a .done was
+// mismatched-and-discarded vs. simply absent. Return value: -1 = no .done to
+// consume yet; 0 = success; >0 = exit code from a hook-error sentinel.
+func tryFinish(slaveDir, turnID string) (int, error) {
+	exit, err, _ := tryFinishV(slaveDir, turnID)
+	return exit, err
 }
 
-// tryFinishV is tryFinish with an extra return indicating whether a .done
-// existed at all (matched and consumed, mismatched and discarded, or absent).
-func tryFinishV(slaveDir, turnID string) (ok bool, err error, mismatched bool) {
+// tryFinishV consumes a .done if its TurnID strictly matches turnID. Empty
+// or different TurnIDs are discarded (mismatched=true). A consumed .done
+// whose Text begins with the hook-error sentinel is reported as a non-zero
+// exit code (so scripts can detect hook failure).
+func tryFinishV(slaveDir, turnID string) (exit int, err error, mismatched bool) {
 	d, rerr := state.ReadDone(slaveDir)
 	if rerr != nil {
 		if os.IsNotExist(rerr) {
-			return false, nil, false
+			return -1, nil, false
 		}
-		return false, CLIError(exitcode.InternalError, "read .done: %v", rerr), false
+		return -1, CLIError(exitcode.InternalError, "read .done: %v", rerr), false
 	}
-	if d.TurnID != "" && d.TurnID != turnID {
+	if d.TurnID != turnID {
+		// Strict match: empty TurnID (legacy/malformed) and prior-turn IDs
+		// are both treated as mismatch. Drop and keep waiting.
 		_ = state.RemoveDone(slaveDir)
-		return false, nil, true
+		return -1, nil, true
 	}
 	_ = state.RemovePending(slaveDir)
-	fmt.Print(d.Text)
-	return true, nil, false
+	text := d.Text
+	if !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	fmt.Print(text)
+	if strings.HasPrefix(d.Text, hookErrSentinel) {
+		return exitcode.Crash, nil, false
+	}
+	return 0, nil, false
+}
+
+// findUnsafeControlByte returns a human description of the first disallowed
+// control character in s, or "" if the prompt is safe. Newline/tab/CR are
+// allowed; everything else < 0x20 plus DEL (0x7f) and ESC (already covered
+// by <0x20) is rejected.
+func findUnsafeControlByte(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\n' || c == '\t' || c == '\r' {
+			continue
+		}
+		if c < 0x20 || c == 0x7f {
+			return fmt.Sprintf("0x%02x at offset %d", c, i)
+		}
+	}
+	return ""
 }
 
 func init() {

@@ -53,20 +53,25 @@ var internalStopMarkerCmd = &cobra.Command{
 			return fmt.Errorf("invalid slave dir for id %q", slaveID)
 		}
 
-		turnID := ""
-		if lock, lerr := state.ReadPending(slaveDir); lerr == nil {
-			turnID = lock.TurnID
+		// No active .pending → no `conductor send` is waiting for this turn.
+		// The hook is an orphan (user typed into the pane, or a prior send
+		// already gave up). Logging it to transcript.log is enough; writing
+		// .done would risk a subsequent send accepting our content as its own.
+		lock, lerr := state.ReadPending(slaveDir)
+		if lerr != nil {
+			logOrphanHook(slaveDir, hookIn.SessionID, "no .pending lock present")
+			return nil
 		}
+		turnID := lock.TurnID
 
 		text, terr := transcript.LastAssistantText(hookIn.TranscriptPath)
 		if terr != nil {
-			// Use the [conductor hook error] sentinel so callers can detect
-			// this isn't a real assistant reply.
 			if werr := state.WriteDoneError(slaveDir, turnID,
 				fmt.Sprintf("transcript read: %v", terr)); werr != nil {
 				return werr
 			}
-			return nil
+			// Surface the underlying error to Claude Code's hook log too.
+			return terr
 		}
 
 		if werr := state.WriteDone(slaveDir, turnID, text); werr != nil {
@@ -84,6 +89,22 @@ var internalStopMarkerCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// logOrphanHook records a Stop hook that fired with no .pending lock to
+// transcript.log. We deliberately do NOT write a .done file because there
+// is no caller to deliver to, and any .done we wrote could later be
+// mis-attributed to a future `conductor send`'s turn.
+func logOrphanHook(slaveDir, sessionID, why string) {
+	line := fmt.Sprintf("%s | ORPHAN HOOK | %s | session=%s\n",
+		time.Now().UTC().Format(time.RFC3339), why, sessionID)
+	f, err := os.OpenFile(filepath.Join(slaveDir, "transcript.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
 }
 
 func init() {

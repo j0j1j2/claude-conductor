@@ -27,10 +27,15 @@ func installProjectHooks(projectCwd, conductorBin string) (restore func(), err e
 	}
 	target := filepath.Join(claudeDir, "settings.local.json")
 
+	var backupContent []byte
 	var backupPath string
+	alreadyConductor := false
 	if existing, err := os.ReadFile(target); err == nil {
-		if !looksLikeConductor(existing) {
+		if looksLikeConductor(existing) {
+			alreadyConductor = true
+		} else {
 			backupPath = nextBackupPath(target)
+			backupContent = existing
 			if werr := os.WriteFile(backupPath, existing, 0o644); werr != nil {
 				return func() {}, werr
 			}
@@ -44,13 +49,22 @@ func installProjectHooks(projectCwd, conductorBin string) (restore func(), err e
 		return func() {}, err
 	}
 
+	// If the file was ALREADY conductor-owned when we got here, we did not
+	// displace anything user-visible. Return a no-op restore so a later
+	// rollback can't delete the conductor file we share with a peer process.
+	if alreadyConductor {
+		return func() {}, nil
+	}
+
+	// Capture backup content into the closure (path + content) so a stale
+	// backup file does not affect correctness; the restore is self-contained.
 	restore = func() {
 		_ = os.Remove(target)
+		if backupContent != nil {
+			_ = os.WriteFile(target, backupContent, 0o644)
+		}
 		if backupPath != "" {
-			if b, rerr := os.ReadFile(backupPath); rerr == nil {
-				_ = os.WriteFile(target, b, 0o644)
-				_ = os.Remove(backupPath)
-			}
+			_ = os.Remove(backupPath)
 		}
 	}
 	return restore, nil

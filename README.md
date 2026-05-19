@@ -10,11 +10,12 @@ You give a high-level goal to the **master** Claude. The master writes prompts f
 
 - tmux
 - `claude` (Claude Code CLI, logged in with a Pro/Max subscription)
-- Go 1.22+ (to build)
+- Go 1.25+ (to build)
+- Unix (Linux or macOS — Windows is not supported)
 
 ## Install
 
-One-liner (requires Go 1.22+):
+One-liner (requires Go 1.25+ and Unix):
 
 ```bash
 go install github.com/j0j1j2/claude-conductor/cmd/conductor@latest
@@ -60,6 +61,7 @@ conductor list                              # active slaves with status
 conductor last <id>                         # print slave's last response (empty if none)
 conductor doctor <id>                       # full diagnostic report
 conductor unstick <id> [--force]            # clear a stale .pending lock
+conductor version                           # build info
 ```
 
 `reset`, `kill`, and `unstick` refuse to act on a slave with a live `.pending`

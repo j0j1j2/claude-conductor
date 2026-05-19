@@ -137,7 +137,10 @@ func TestWriteReadDone_turnID(t *testing.T) {
 	}
 }
 
-func TestReadDone_legacyPlainText(t *testing.T) {
+func TestReadDone_legacyOrMalformedHasEmptyTurnID(t *testing.T) {
+	// Malformed / legacy .done files no longer trick the caller into
+	// accepting them — ReadDone returns an empty TurnID so tryFinish
+	// treats it as a mismatch.
 	tempHome(t)
 	slaveDir := SlaveDir("s", "s1")
 	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
@@ -150,8 +153,8 @@ func TestReadDone_legacyPlainText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.TurnID != "" || got.Text != "legacy content" {
-		t.Errorf("legacy fallback failed: %+v", got)
+	if got.TurnID != "" {
+		t.Errorf("expected empty TurnID for non-JSON .done, got %q", got.TurnID)
 	}
 }
 

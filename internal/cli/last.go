@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
 	"github.com/j0j1j2/claude-conductor/internal/state"
@@ -32,11 +33,16 @@ var lastCmd = &cobra.Command{
 		d, err := state.ReadDone(state.SlaveDir(sess, id))
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil // no prior response yet; exit 0 with empty stdout
+				fmt.Fprintln(os.Stderr, "(no response yet)")
+				return nil
 			}
 			return CLIError(exitcode.InternalError, "read .done: %v", err)
 		}
-		fmt.Print(d.Text)
+		text := d.Text
+		if text != "" && !strings.HasSuffix(text, "\n") {
+			text += "\n"
+		}
+		fmt.Print(text)
 		return nil
 	},
 }

@@ -258,21 +258,19 @@ func WriteDone(slaveDir, turnID, content string) error {
 	return nil
 }
 
-// ReadDone reads a `.done` file. If the file is in the legacy plain-text
-// format (no TurnID), the returned Done has an empty TurnID; callers should
-// then accept it (no turn-matching enforced for legacy content).
+// ReadDone reads a `.done` file. It REQUIRES the JSON format produced by
+// WriteDone — a missing or empty TurnID is treated as a turn-mismatch and
+// callers should discard it. (Legacy plain-text fallback has been removed
+// because it was being exploited to deliver prior-turn content to new sends.)
 func ReadDone(slaveDir string) (Done, error) {
 	b, err := os.ReadFile(filepath.Join(slaveDir, ".done"))
 	if err != nil {
 		return Done{}, err
 	}
-	trimmed := strings.TrimSpace(string(b))
-	if !strings.HasPrefix(trimmed, "{") {
-		return Done{Text: string(b)}, nil
-	}
 	var d Done
 	if jerr := json.Unmarshal(b, &d); jerr != nil {
-		return Done{Text: string(b)}, nil // fallback: treat as raw text
+		// Malformed .done; treat as empty TurnID so caller discards it.
+		return Done{Text: string(b)}, nil
 	}
 	return d, nil
 }
