@@ -158,6 +158,58 @@ func TestReadDone_legacyOrMalformedHasEmptyTurnID(t *testing.T) {
 	}
 }
 
+func TestCreatePendingWithWatermark_roundTrip(t *testing.T) {
+	tempHome(t)
+	slaveDir := SlaveDir("s", "s1")
+	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	turnID, err := CreatePendingWithWatermark(slaveDir, "/tmp/transcript.jsonl", 12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if turnID == "" {
+		t.Fatal("expected turn id")
+	}
+	lock, err := ReadPending(slaveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.TranscriptPath != "/tmp/transcript.jsonl" {
+		t.Errorf("transcript path round-trip: got %q", lock.TranscriptPath)
+	}
+	if lock.TranscriptOffset != 12345 {
+		t.Errorf("transcript offset round-trip: got %d", lock.TranscriptOffset)
+	}
+	if lock.TurnID != turnID {
+		t.Errorf("turn id mismatch")
+	}
+}
+
+func TestTranscriptPathStickyFile(t *testing.T) {
+	tempHome(t)
+	slaveDir := SlaveDir("s", "s1")
+	if err := os.MkdirAll(slaveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadTranscriptPath(slaveDir); got != "" {
+		t.Errorf("expected empty initial path, got %q", got)
+	}
+	if err := WriteTranscriptPath(slaveDir, "/some/transcript.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadTranscriptPath(slaveDir); got != "/some/transcript.jsonl" {
+		t.Errorf("got %q", got)
+	}
+	// Subsequent writes overwrite.
+	if err := WriteTranscriptPath(slaveDir, "/other/transcript.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadTranscriptPath(slaveDir); got != "/other/transcript.jsonl" {
+		t.Errorf("got %q", got)
+	}
+}
+
 func TestSlaveExists(t *testing.T) {
 	tempHome(t)
 	if SlaveExists("s", "s1") {

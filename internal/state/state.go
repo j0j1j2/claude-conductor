@@ -80,12 +80,22 @@ func SlaveExists(session, id string) bool {
 	return err == nil
 }
 
-// PendingLock is the structured content of a .pending file. The TurnID lets
-// `_internal_stop_marker` tag .done with the same turn the caller asked for,
-// so a delayed prior-turn Stop hook cannot impersonate the current turn.
+// PendingLock is the structured content of a .pending file.
+//
+// TurnID alone is insufficient to discriminate prior-turn stragglers: a
+// delayed Stop hook reads whatever .pending happens to be on disk and would
+// stamp its (prior-turn) transcript text with our (new) turn id. To close
+// that race, the lock also embeds a "transcript watermark": the path of the
+// slave's claude transcript file and the byte offset that file had when the
+// send acquired the lock. The Stop hook compares its current transcript path
+// and size against this watermark; if the path matches and the size has not
+// grown past the offset, the hook is firing for content that pre-dates the
+// new prompt and must NOT be delivered.
 type PendingLock struct {
-	PID    int    `json:"pid"`
-	TurnID string `json:"turn_id"`
+	PID              int    `json:"pid"`
+	TurnID           string `json:"turn_id"`
+	TranscriptPath   string `json:"transcript_path,omitempty"`
+	TranscriptOffset int64  `json:"transcript_offset,omitempty"`
 }
 
 // NewTurnID returns a fresh per-send identifier.
@@ -96,15 +106,27 @@ func NewTurnID() string {
 }
 
 // CreatePending creates the `.pending` file exclusively, recording PID and a
-// fresh TurnID. On contention the existing lock is validated:
+// fresh TurnID. Watermark fields are unset; suitable for the first send when
+// no transcript path is known yet. See CreatePendingWithWatermark for the
+// race-tight variant.
+func CreatePending(slaveDir string) (string, error) {
+	return CreatePendingWithWatermark(slaveDir, "", 0)
+}
+
+// CreatePendingWithWatermark creates a `.pending` file with a transcript
+// watermark embedded. The Stop hook honors the watermark to reject delayed
+// prior-turn hooks. On contention the existing lock is validated:
 //   - The recorded PID is no longer alive → stale, take over.
 //   - Otherwise the lock is live → ErrBusy.
-//
-// Returns the newly written turn ID on success.
-func CreatePending(slaveDir string) (string, error) {
-	turnID := NewTurnID()
-	if err := writePending(slaveDir, PendingLock{PID: os.Getpid(), TurnID: turnID}); err == nil {
-		return turnID, nil
+func CreatePendingWithWatermark(slaveDir, transcriptPath string, transcriptOffset int64) (string, error) {
+	lock := PendingLock{
+		PID:              os.Getpid(),
+		TurnID:           NewTurnID(),
+		TranscriptPath:   transcriptPath,
+		TranscriptOffset: transcriptOffset,
+	}
+	if err := writePending(slaveDir, lock); err == nil {
+		return lock.TurnID, nil
 	} else if !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
@@ -113,10 +135,44 @@ func CreatePending(slaveDir string) (string, error) {
 		return "", ErrBusy
 	}
 
-	if err := writePendingForce(slaveDir, PendingLock{PID: os.Getpid(), TurnID: turnID}); err != nil {
+	if err := writePendingForce(slaveDir, lock); err != nil {
 		return "", err
 	}
-	return turnID, nil
+	return lock.TurnID, nil
+}
+
+// TranscriptPathFile is the sticky file inside a slave's state dir that
+// records the most recent transcript path observed via a Stop hook firing.
+// `conductor send` reads it to compute the watermark before injecting.
+const transcriptPathFile = "transcript-path"
+
+// WriteTranscriptPath atomically records the slave's current transcript path.
+// Called by _internal_stop_marker on every fire.
+func WriteTranscriptPath(slaveDir, path string) error {
+	if path == "" {
+		return nil
+	}
+	tmp := filepath.Join(slaveDir, transcriptPathFile+".tmp")
+	final := filepath.Join(slaveDir, transcriptPathFile)
+	if err := os.WriteFile(tmp, []byte(path), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// ReadTranscriptPath returns the most recently observed transcript path for
+// the slave, or "" if none has been recorded yet (e.g. first send of session,
+// fresh after reset).
+func ReadTranscriptPath(slaveDir string) string {
+	b, err := os.ReadFile(filepath.Join(slaveDir, transcriptPathFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // writePending is the exclusive-create path used on a fresh lock. The file

@@ -62,10 +62,16 @@ var sendCmd = &cobra.Command{
 		}
 		slaveDir := state.SlaveDir(sess, id)
 
+		// Compute the transcript watermark: the slave's claude transcript
+		// path (recorded by the most recent Stop hook) and its current size.
+		// A delayed prior-turn hook firing after we acquire the lock will be
+		// rejected if the transcript hasn't grown past this offset.
+		transcriptPath, transcriptOffset := readTranscriptWatermark(slaveDir)
+
 		// Acquire a turn-id'd lock BEFORE doing anything observable to the
 		// slave; concurrent senders thus fan out into busy/ok without racing
 		// on shared keystrokes.
-		turnID, err := state.CreatePending(slaveDir)
+		turnID, err := state.CreatePendingWithWatermark(slaveDir, transcriptPath, transcriptOffset)
 		if err != nil {
 			if errors.Is(err, state.ErrBusy) {
 				return CLIError(exitcode.Busy, "slave %s is busy", id)
@@ -233,6 +239,23 @@ func tryFinishV(slaveDir, turnID string) (exit int, err error, mismatched bool) 
 		return exitcode.Crash, nil, false
 	}
 	return 0, nil, false
+}
+
+// readTranscriptWatermark resolves the slave's current transcript path and
+// stats it for a size, to use as a "drop everything before this offset"
+// barrier for the Stop hook. Both values may be empty/zero when no transcript
+// path has been recorded yet (e.g. very first send, or right after reset);
+// the Stop hook then falls back to legacy behavior for this one turn.
+func readTranscriptWatermark(slaveDir string) (string, int64) {
+	path := state.ReadTranscriptPath(slaveDir)
+	if path == "" {
+		return "", 0
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return path, 0
+	}
+	return path, fi.Size()
 }
 
 // findUnsafeControlByte returns a human description of the first disallowed
