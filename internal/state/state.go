@@ -21,9 +21,6 @@ var ErrBusy = errors.New("state: slave is busy")
 // ErrInvalidSlaveID means the slave ID did not pass the safety allow-list.
 var ErrInvalidSlaveID = errors.New("state: invalid slave id (must match [a-zA-Z0-9_-]{1,32}, not reserved)")
 
-// ErrTurnMismatch means a .done was written by a different turn than the one
-// the caller is waiting for. The caller should ignore it and keep waiting.
-var ErrTurnMismatch = errors.New("state: .done belongs to a different turn")
 
 // slaveIDRe is the allow-list applied to every slave identifier flowing into
 // filesystem paths or hook arguments.
@@ -100,10 +97,7 @@ func NewTurnID() string {
 
 // CreatePending creates the `.pending` file exclusively, recording PID and a
 // fresh TurnID. On contention the existing lock is validated:
-//   - A `.done` for the same turn means we are seeing our own completion arrive
-//     in a race; that's not "busy", but it's also not a clean takeover — we
-//     return ErrBusy so the caller can re-attempt. (Practically rare.)
-//   - The recorded PID is no longer alive — the lock is stale.
+//   - The recorded PID is no longer alive → stale, take over.
 //   - Otherwise the lock is live → ErrBusy.
 //
 // Returns the newly written turn ID on success.
@@ -111,7 +105,7 @@ func CreatePending(slaveDir string) (string, error) {
 	turnID := NewTurnID()
 	if err := writePending(slaveDir, PendingLock{PID: os.Getpid(), TurnID: turnID}); err == nil {
 		return turnID, nil
-	} else if !os.IsExist(err) {
+	} else if !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
 
@@ -119,31 +113,40 @@ func CreatePending(slaveDir string) (string, error) {
 		return "", ErrBusy
 	}
 
-	// Stale lock takeover: rewrite atomically via tmp+rename so a concurrent
-	// taker doesn't see a half-written file or step on us.
 	if err := writePendingForce(slaveDir, PendingLock{PID: os.Getpid(), TurnID: turnID}); err != nil {
 		return "", err
 	}
 	return turnID, nil
 }
 
-// writePending is the exclusive-create path used on a fresh lock.
+// writePending is the exclusive-create path used on a fresh lock. The file
+// is written to a tmp path first and renamed in so concurrent ReadPending
+// callers never observe a partially-written file.
 func writePending(slaveDir string, lock PendingLock) error {
 	pendingPath := filepath.Join(slaveDir, ".pending")
-	f, err := os.OpenFile(pendingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	// Probe for existence first; if a file is already there, surface
+	// os.ErrExist so CreatePending's caller can route into staleness.
+	if _, err := os.Stat(pendingPath); err == nil {
+		return os.ErrExist
+	}
+	tmp := filepath.Join(slaveDir, ".pending.tmp")
+	b, err := json.Marshal(lock)
 	if err != nil {
+		return fmt.Errorf("marshal pending: %w", err)
+	}
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	enc := json.NewEncoder(f)
-	if encErr := enc.Encode(lock); encErr != nil {
-		_ = f.Close()
-		_ = os.Remove(pendingPath)
-		return fmt.Errorf("write pending: %w", encErr)
+	// Use Link+Remove (so a concurrent writer racing us gets EEXIST on Link)
+	// to keep the create exclusive.
+	if err := os.Link(tmp, pendingPath); err != nil {
+		_ = os.Remove(tmp)
+		if os.IsExist(err) {
+			return os.ErrExist
+		}
+		return err
 	}
-	if cErr := f.Close(); cErr != nil {
-		_ = os.Remove(pendingPath)
-		return fmt.Errorf("close pending: %w", cErr)
-	}
+	_ = os.Remove(tmp)
 	return nil
 }
 

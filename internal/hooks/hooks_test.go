@@ -69,11 +69,11 @@ func TestRenderRunScript_quotedValues(t *testing.T) {
 	if !strings.Contains(got, `cd '/home/me/proj'`) {
 		t.Error("must cd into single-quoted project dir")
 	}
-	if !strings.Contains(got, `exec claude --dangerously-skip-permissions`) {
-		t.Error("must exec claude with flag")
+	if !strings.Contains(got, `claude --dangerously-skip-permissions`) {
+		t.Error("must run claude with flag")
 	}
-	if !strings.Contains(got, `echo $? > '/slave/dir/.exit-code'`) {
-		t.Error("must trap exit code with quoted path")
+	if !strings.Contains(got, `echo "$ec" > '/slave/dir/.exit-code'`) {
+		t.Error("must write captured exit code with quoted path")
 	}
 	if !strings.Contains(got, `export CONDUCTOR_SLAVE_ID='s1'`) {
 		t.Error("must export CONDUCTOR_SLAVE_ID quoted")
@@ -110,8 +110,18 @@ func TestShellQuote(t *testing.T) {
 		{"", "''"},
 	}
 	for _, c := range cases {
-		if got := shellQuote(c.in); got != c.want {
-			t.Errorf("shellQuote(%q) = %q, want %q", c.in, got, c.want)
+		if got := ShellQuote(c.in); got != c.want {
+			t.Errorf("ShellQuote(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestRenderRunScript_noExec(t *testing.T) {
+	got := RenderRunScript("/s", "/p", "s1")
+	if strings.Contains(got, "exec claude") {
+		t.Error("run.sh must not `exec claude` — the EXIT trap would not fire")
+	}
+	if !strings.Contains(got, `echo "$ec" > '/s/.exit-code'`) {
+		t.Error("run.sh must capture claude's exit code into .exit-code")
 	}
 }

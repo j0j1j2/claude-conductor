@@ -60,7 +60,13 @@ var internalStopMarkerCmd = &cobra.Command{
 
 		text, terr := transcript.LastAssistantText(hookIn.TranscriptPath)
 		if terr != nil {
-			text = fmt.Sprintf("(transcript read error: %v)", terr)
+			// Use the [conductor hook error] sentinel so callers can detect
+			// this isn't a real assistant reply.
+			if werr := state.WriteDoneError(slaveDir, turnID,
+				fmt.Sprintf("transcript read: %v", terr)); werr != nil {
+				return werr
+			}
+			return nil
 		}
 
 		if werr := state.WriteDone(slaveDir, turnID, text); werr != nil {

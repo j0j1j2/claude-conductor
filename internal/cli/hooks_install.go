@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/j0j1j2/claude-conductor/internal/hooks"
 )
@@ -36,8 +37,7 @@ func installProjectHooks(projectCwd, conductorBin string) (restore func(), err e
 		}
 	}
 
-	if err := os.WriteFile(target, []byte(hooks.RenderProjectSettings(conductorBin)), 0o644); err != nil {
-		// Roll back the backup we just made (if any) so we leave no trace.
+	if err := atomicWriteFile(target, []byte(hooks.RenderProjectSettings(conductorBin)), 0o644); err != nil {
 		if backupPath != "" {
 			_ = os.Remove(backupPath)
 		}
@@ -79,16 +79,20 @@ func nextBackupPath(target string) string {
 }
 
 func itoa(n int) string {
-	// tiny stdlib-free int->string to keep this file dependency-light
-	if n == 0 {
-		return "0"
+	return strconv.Itoa(n)
+}
+
+// atomicWriteFile writes content via a sibling tmp file + rename so concurrent
+// readers (e.g., the slave's claude reading settings.local.json at startup)
+// never observe a partial write.
+func atomicWriteFile(path string, content []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, content, perm); err != nil {
+		return err
 	}
-	buf := [12]byte{}
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
-	return string(buf[i:])
+	return nil
 }

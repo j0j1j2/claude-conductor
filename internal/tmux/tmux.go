@@ -2,6 +2,7 @@
 package tmux
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,26 +22,13 @@ func SendKeysCmd(session, window string, keys ...string) *exec.Cmd {
 }
 
 // SendLiteralCmd builds `tmux send-keys -l -t <session>:<window> <text>`.
-// The -l flag forces the text to be treated as literal keystrokes, bypassing
-// tmux's key-name interpretation. This is the safe way to type arbitrary text
-// (including multi-line prompts) into a TUI running inside the pane.
+// The -l flag forces the text to be treated as literal keystrokes.
 func SendLiteralCmd(session, window, text string) *exec.Cmd {
 	return exec.Command("tmux", "send-keys", "-l", "-t", session+":"+window, text)
 }
 
-// LoadBufferCmd builds `tmux load-buffer <file>`.
-func LoadBufferCmd(path string) *exec.Cmd {
-	return exec.Command("tmux", "load-buffer", path)
-}
-
-// PasteBufferCmd builds `tmux paste-buffer -t <session>:<window>`.
-func PasteBufferCmd(session, window string) *exec.Cmd {
-	return exec.Command("tmux", "paste-buffer", "-t", session+":"+window)
-}
-
 // NewWindowCmd builds `tmux new-window -d -t <session> -n <name> <cmd>`.
-// The -d flag creates the window without switching focus to it, so spawning
-// a slave does not yank the user away from the master window.
+// The -d flag creates the window without switching focus to it.
 func NewWindowCmd(session, name, command string) *exec.Cmd {
 	return exec.Command("tmux", "new-window", "-d", "-t", session, "-n", name, command)
 }
@@ -55,11 +43,6 @@ func HasSessionCmd(session string) *exec.Cmd {
 	return exec.Command("tmux", "has-session", "-t", session)
 }
 
-// NewSessionCmd builds `tmux new-session -d -s <session> <command>`.
-func NewSessionCmd(session, command string) *exec.Cmd {
-	return exec.Command("tmux", "new-session", "-d", "-s", session, command)
-}
-
 // NewSessionCmdShell builds `tmux new-session -d -s <session>` using the
 // default shell for window 0 (no command override).
 func NewSessionCmdShell(session string) *exec.Cmd {
@@ -72,13 +55,16 @@ func AttachSessionCmd(session string) *exec.Cmd {
 }
 
 // CurrentSession returns the tmux session name the process is attached to.
-// Caller must ensure InTmux() is true.
 func CurrentSession() (string, error) {
 	out, err := exec.Command("tmux", "display-message", "-p", "#S").Output()
 	if err != nil {
 		return "", err
 	}
-	return parseSessionName(string(out)), nil
+	name := parseSessionName(string(out))
+	if name == "" {
+		return "", fmt.Errorf("tmux returned empty session name")
+	}
+	return name, nil
 }
 
 func parseSessionName(s string) string {
@@ -97,35 +83,6 @@ func PaneDead(session, window string) (bool, error) {
 	return parsePaneDead(string(out)), nil
 }
 
-// WindowGone classifies an error from PaneDead/CapturePane as a "the window
-// does not exist" condition. tmux writes "can't find window" / "can't find
-// pane" on stderr when the target is gone; exec.Cmd surfaces that as an
-// *exec.ExitError whose Stderr we can inspect.
-func WindowGone(err error) bool {
-	if err == nil {
-		return false
-	}
-	var ee *exec.ExitError
-	if !errorsAs(err, &ee) {
-		return strings.Contains(err.Error(), "can't find")
-	}
-	s := strings.ToLower(string(ee.Stderr))
-	return strings.Contains(s, "can't find") ||
-		strings.Contains(s, "no such") ||
-		strings.Contains(s, "not found")
-}
-
-// errorsAs is a tiny shim to avoid pulling in `errors` just for As().
-func errorsAs(err error, target any) bool {
-	if ee, ok := err.(*exec.ExitError); ok {
-		if p, ok := target.(**exec.ExitError); ok {
-			*p = ee
-			return true
-		}
-	}
-	return false
-}
-
 // CapturePane returns the last n lines of the given window's pane buffer.
 func CapturePane(session, window string, n int) (string, error) {
 	out, err := exec.Command("tmux", "capture-pane",
@@ -139,4 +96,20 @@ func CapturePane(session, window string, n int) (string, error) {
 
 func parsePaneDead(s string) bool {
 	return strings.TrimSpace(s) == "1"
+}
+
+// WindowGone classifies an error from PaneDead/CapturePane as a "the window
+// does not exist" condition.
+func WindowGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		s := strings.ToLower(string(ee.Stderr))
+		return strings.Contains(s, "can't find") ||
+			strings.Contains(s, "no such") ||
+			strings.Contains(s, "not found")
+	}
+	return strings.Contains(err.Error(), "can't find")
 }

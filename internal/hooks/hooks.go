@@ -18,7 +18,7 @@ const ConductorMarker = "conductor-managed-do-not-edit-this-block"
 // slave Claude processes (whose run.sh exports the var) trigger them; the
 // master session, sharing the same cwd, treats the hooks as no-ops.
 func RenderProjectSettings(conductorBin string) string {
-	binQ := shellQuote(conductorBin)
+	binQ := ShellQuote(conductorBin)
 	stopCmd := fmt.Sprintf(
 		`[ -n "$CONDUCTOR_SLAVE_ID" ] && %s _internal_stop_marker "$CONDUCTOR_SLAVE_ID"`,
 		binQ)
@@ -52,25 +52,30 @@ func RenderProjectSettings(conductorBin string) string {
 
 // RenderRunScript returns the content of the slave's run.sh. It exports
 // CONDUCTOR_SLAVE_ID so the shared project hook can identify which slave
-// is firing, traps the exit code, and execs claude in the project cwd.
+// is firing, runs claude as a child (NOT via `exec`) so the shell stays
+// alive long enough to capture claude's exit status, and writes that
+// status to .exit-code.
 //
 // All embedded values are single-quoted with `'\''` escaping so a directory
 // containing quotes or shell metacharacters cannot inject shell commands.
 func RenderRunScript(slaveDir, projectCwd, slaveID string) string {
 	return fmt.Sprintf(`#!/usr/bin/env bash
 export CONDUCTOR_SLAVE_ID=%s
-trap 'echo $? > %s' EXIT
 cd %s
-exec claude --dangerously-skip-permissions
+claude --dangerously-skip-permissions
+ec=$?
+echo "$ec" > %s
+exit "$ec"
 `,
-		shellQuote(slaveID),
-		shellQuote(slaveDir+"/.exit-code"),
-		shellQuote(projectCwd),
+		ShellQuote(slaveID),
+		ShellQuote(projectCwd),
+		ShellQuote(slaveDir+"/.exit-code"),
 	)
 }
 
-// shellQuote single-quotes s for bash/sh and escapes any embedded single
-// quotes via the standard `'\''` idiom.
-func shellQuote(s string) string {
+// ShellQuote single-quotes s for bash/sh and escapes any embedded single
+// quotes via the standard `'\''` idiom. Exported so other packages can
+// reuse the same escaping rule without re-implementing it.
+func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

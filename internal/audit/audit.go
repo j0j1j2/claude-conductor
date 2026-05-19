@@ -1,3 +1,5 @@
+//go:build unix
+
 // Package audit appends NDJSON audit entries to a log file.
 package audit
 

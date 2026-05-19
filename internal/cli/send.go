@@ -37,11 +37,22 @@ var sendCmd = &cobra.Command{
 			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
 		}
 		prompt := args[1]
+		if sendTimeout < 1 {
+			sendTimeout = 1
+		}
 
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
 		slaveDir := state.SlaveDir(sess, id)
+
+		// Drain phase: cancel any in-flight prior turn and wait briefly for
+		// the previous Stop hook (if any) to land. This narrows the window
+		// in which the *current* turn's Stop hook could attribute a prior
+		// turn's response to our new turn id.
+		_ = tmux.SendKeysCmd(sess, id, "Escape").Run()
+		time.Sleep(300 * time.Millisecond)
+		_ = state.RemoveDone(slaveDir)
 
 		// Acquire a turn-id'd lock so this send can later distinguish its own
 		// .done from any straggling Stop-hook completion of a prior turn.
@@ -94,6 +105,9 @@ var sendCmd = &cobra.Command{
 		liveness := time.NewTicker(1 * time.Second)
 		defer liveness.Stop()
 
+		// Track recent mismatched-turn events so we don't burn CPU if a
+		// misbehaving hook keeps rewriting the same wrong .done.
+		mismatches := 0
 		for {
 			select {
 			case ev, ok := <-w.Events:
@@ -102,11 +116,21 @@ var sendCmd = &cobra.Command{
 				}
 				if ev.Op&(fsnotify.Create|fsnotify.Write) != 0 &&
 					filepath.Base(ev.Name) == ".done" {
-					if okFin, ferr := tryFinish(slaveDir, turnID); ferr != nil {
+					okFin, ferr, matched := tryFinishV(slaveDir, turnID)
+					if ferr != nil {
 						return ferr
-					} else if okFin {
+					}
+					if okFin {
 						sendDone = true
 						return nil
+					}
+					if !matched {
+						mismatches++
+						if mismatches > 50 {
+							return CLIError(exitcode.Crash,
+								"slave %s keeps emitting prior-turn responses (%d mismatches); try `conductor reset %s`",
+								id, mismatches, id)
+						}
 					}
 				}
 				// Slave's state dir vanished beneath us (kill / reset midway).
@@ -163,21 +187,27 @@ var sendCmd = &cobra.Command{
 // turn (a prior-turn Stop hook racing us), it discards the file and keeps
 // waiting. Returns (false, nil) when .done does not yet exist.
 func tryFinish(slaveDir, turnID string) (bool, error) {
-	d, err := state.ReadDone(slaveDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
+	ok, err, _ := tryFinishV(slaveDir, turnID)
+	return ok, err
+}
+
+// tryFinishV is tryFinish with an extra return indicating whether a .done
+// existed at all (matched and consumed, mismatched and discarded, or absent).
+func tryFinishV(slaveDir, turnID string) (ok bool, err error, mismatched bool) {
+	d, rerr := state.ReadDone(slaveDir)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return false, nil, false
 		}
-		return false, CLIError(exitcode.InternalError, "read .done: %v", err)
+		return false, CLIError(exitcode.InternalError, "read .done: %v", rerr), false
 	}
 	if d.TurnID != "" && d.TurnID != turnID {
-		// Stale Stop hook from a previous turn; drop and keep waiting.
 		_ = state.RemoveDone(slaveDir)
-		return false, nil
+		return false, nil, true
 	}
 	_ = state.RemovePending(slaveDir)
 	fmt.Print(d.Text)
-	return true, nil
+	return true, nil, false
 }
 
 func init() {

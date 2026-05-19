@@ -171,15 +171,36 @@ func insideTmux(projectCwd string) error {
 		return CLIError(exitcode.InternalError, "os.Executable: %v", err)
 	}
 
+	// Resolve everything we need BEFORE spawning s1 so a missing `claude`
+	// binary or unreadable SYSTEM.md doesn't leak a spawned slave window.
+	sysBytes, err := os.ReadFile(systemPath)
+	if err != nil {
+		return CLIError(exitcode.InternalError, "read SYSTEM.md: %v", err)
+	}
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return CLIError(exitcode.InternalError, "cannot find `claude` on PATH: %v", err)
+	}
+
 	restoreHooks, err := installProjectHooks(projectCwd, conductorBin)
 	if err != nil {
 		return CLIError(exitcode.InternalError, "install project hooks: %v", err)
 	}
-	bootstrapSucceeded := false
+	// Rollback if anything below this point fails. syscall.Exec replaces our
+	// process on success, so the defer NEVER runs on success — meaning we
+	// must NOT pre-mark "succeeded". An Exec failure correctly triggers
+	// rollback (hooks restored, master/s1 cleaned up).
+	bootstrapFailed := true
+	var s1Spawned bool
 	defer func() {
-		if !bootstrapSucceeded {
-			restoreHooks()
-			_ = os.RemoveAll(masterDir)
+		if !bootstrapFailed {
+			return
+		}
+		restoreHooks()
+		_ = os.RemoveAll(masterDir)
+		if s1Spawned {
+			_ = tmux.KillWindowCmd(sess, "s1").Run()
+			_ = os.RemoveAll(state.SlaveDir(sess, "s1"))
 		}
 	}()
 
@@ -189,27 +210,16 @@ func insideTmux(projectCwd string) error {
 	if err := spawnCmd.Run(); err != nil {
 		return CLIError(exitcode.InternalError, "pre-spawn s1: %v", err)
 	}
-
-	sysBytes, err := os.ReadFile(systemPath)
-	if err != nil {
-		return CLIError(exitcode.InternalError, "read SYSTEM.md: %v", err)
-	}
-
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		return CLIError(exitcode.InternalError, "cannot find `claude` on PATH: %v", err)
-	}
+	s1Spawned = true
 
 	argv := []string{
 		"claude",
 		"--append-system-prompt", string(sysBytes),
 		"--dangerously-skip-permissions",
 	}
-	// We are about to hand the process off to claude permanently. After this
-	// point our defers will not run, so we mark bootstrap successful first.
-	bootstrapSucceeded = true
-	if err := syscall.Exec(claudePath, argv, scrubbedEnv()); err != nil {
-		return CLIError(exitcode.InternalError, "exec claude: %v", err)
-	}
-	return nil
+	// syscall.Exec returns ONLY on failure; on success the process is
+	// replaced and no Go code runs after. So if we reach the next line, it
+	// is unambiguously a failure and the defer rollback should fire.
+	execErr := syscall.Exec(claudePath, argv, scrubbedEnv())
+	return CLIError(exitcode.InternalError, "exec claude: %v", execErr)
 }

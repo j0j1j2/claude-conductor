@@ -12,22 +12,6 @@ func TestSendKeysCmd(t *testing.T) {
 	}
 }
 
-func TestLoadBufferCmd(t *testing.T) {
-	c := LoadBufferCmd("/tmp/prompt.txt")
-	args := strings.Join(c.Args, " ")
-	if !strings.Contains(args, "load-buffer /tmp/prompt.txt") {
-		t.Errorf("unexpected args: %v", c.Args)
-	}
-}
-
-func TestPasteBufferCmd(t *testing.T) {
-	c := PasteBufferCmd("sess", "s1")
-	args := strings.Join(c.Args, " ")
-	if !strings.Contains(args, "paste-buffer -t sess:s1") {
-		t.Errorf("unexpected args: %v", c.Args)
-	}
-}
-
 func TestNewWindowCmd(t *testing.T) {
 	c := NewWindowCmd("sess", "s2", "/path/to/run.sh")
 	args := strings.Join(c.Args, " ")

@@ -1,13 +1,12 @@
 package cli
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
+	"github.com/j0j1j2/claude-conductor/internal/hooks"
 	"github.com/j0j1j2/claude-conductor/internal/state"
 	"github.com/j0j1j2/claude-conductor/internal/tmux"
 	"github.com/fsnotify/fsnotify"
@@ -62,11 +61,15 @@ var resetCmd = &cobra.Command{
 			return CLIError(exitcode.InternalError, "fsnotify watch: %v", err)
 		}
 
-		// Quote runShPath so a HOME containing spaces does not break the
-		// shell that tmux delivers our keystrokes to.
-		quoted := fmt.Sprintf("'%s'", strings.ReplaceAll(runShPath, "'", `'\''`))
-		if err := tmux.SendKeysCmd(sess, id, quoted, "Enter").Run(); err != nil {
-			return CLIError(exitcode.InternalError, "relaunch run.sh: %v", err)
+		// Type the quoted path as literal keystrokes so a HOME containing
+		// spaces or special chars does not break the slave's shell, and so
+		// tmux's key-name parser does not try to interpret it.
+		quoted := hooks.ShellQuote(runShPath)
+		if err := tmux.SendLiteralCmd(sess, id, quoted).Run(); err != nil {
+			return CLIError(exitcode.InternalError, "type run.sh path: %v", err)
+		}
+		if err := tmux.SendKeysCmd(sess, id, "Enter").Run(); err != nil {
+			return CLIError(exitcode.InternalError, "send Enter: %v", err)
 		}
 
 		deadline := time.After(30 * time.Second)

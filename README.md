@@ -50,14 +50,20 @@ Give the master your goal in plain language.
 ## Subcommands (used by the master, not you directly)
 
 ```
-conductor spawn [--name sN]              # new slave
-conductor send [--timeout S] <id> <msg>  # send prompt, block on completion
-conductor interrupt <id>                 # cancel current turn (Escape)
-conductor reset <id>                     # fresh slave in same window
-conductor kill <id>                      # close window + clean up
-conductor list                           # active slaves
-conductor last <id>                      # print slave's last response
+conductor spawn [--name sN]                 # new slave
+conductor send [--timeout S] [--quiet] <id> <msg>
+                                            # send prompt, block on completion
+conductor interrupt <id>                    # cancel current turn (Escape)
+conductor reset <id> [--force]              # fresh slave in same window
+conductor kill <id> [--force]               # close window + clean up
+conductor list                              # active slaves with status
+conductor last <id>                         # print slave's last response (empty if none)
+conductor doctor <id>                       # full diagnostic report
+conductor unstick <id> [--force]            # clear a stale .pending lock
 ```
+
+`reset`, `kill`, and `unstick` refuse to act on a slave with a live `.pending`
+unless `--force` is passed.
 
 ## Design
 
