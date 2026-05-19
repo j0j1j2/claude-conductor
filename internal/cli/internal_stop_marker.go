@@ -14,6 +14,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// maxStopHookStdin caps the JSON payload Claude Code feeds the hook so a
+// rogue stdin (e.g. user manually invoking the subcommand) cannot OOM us.
+const maxStopHookStdin = 1 << 20 // 1 MiB
+
 type stopHookStdin struct {
 	SessionID      string `json:"session_id"`
 	TranscriptPath string `json:"transcript_path"`
@@ -26,8 +30,11 @@ var internalStopMarkerCmd = &cobra.Command{
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		slaveID := args[0]
+		if err := state.ValidateSlaveID(slaveID); err != nil {
+			return fmt.Errorf("invalid slave id %q: %w", slaveID, err)
+		}
 
-		raw, err := io.ReadAll(os.Stdin)
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, maxStopHookStdin))
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
@@ -41,17 +48,28 @@ var internalStopMarkerCmd = &cobra.Command{
 			return fmt.Errorf("current tmux session: %w", err)
 		}
 
-		text, err := transcript.LastAssistantText(hookIn.TranscriptPath)
-		if err != nil {
-			text = "(no assistant text in transcript)"
+		slaveDir := state.SlaveDir(sess, slaveID)
+		if slaveDir == "" {
+			return fmt.Errorf("invalid slave dir for id %q", slaveID)
 		}
 
-		slaveDir := state.SlaveDir(sess, slaveID)
-		if err := state.WriteDone(slaveDir, text); err != nil {
-			return err
+		turnID := ""
+		if lock, lerr := state.ReadPending(slaveDir); lerr == nil {
+			turnID = lock.TurnID
 		}
-		summary := fmt.Sprintf("%s | turn ended | %d bytes | session=%s\n",
-			time.Now().UTC().Format(time.RFC3339), len(text), hookIn.SessionID)
+
+		text, terr := transcript.LastAssistantText(hookIn.TranscriptPath)
+		if terr != nil {
+			text = fmt.Sprintf("(transcript read error: %v)", terr)
+		}
+
+		if werr := state.WriteDone(slaveDir, turnID, text); werr != nil {
+			_ = state.WriteDoneError(slaveDir, turnID, werr.Error())
+			return werr
+		}
+
+		summary := fmt.Sprintf("%s | turn=%s ended | %d bytes | session=%s\n",
+			time.Now().UTC().Format(time.RFC3339), turnID, len(text), hookIn.SessionID)
 		f, err := os.OpenFile(filepath.Join(slaveDir, "transcript.log"),
 			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err == nil {

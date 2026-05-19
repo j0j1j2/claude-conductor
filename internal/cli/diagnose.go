@@ -1,10 +1,10 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,14 +26,16 @@ type SlaveDiagnosis struct {
 	HasPending  bool
 	PendingAt   time.Time
 	PendingPID  int
+	PendingTurn string
 	PIDAlive    bool
 	HasDone     bool
 	DoneAt      time.Time
+	DoneTurn    string
 	HasExit     bool
 	ExitCode    string
 
-	HookCommand string // first non-empty Stop-hook command pulled from settings.local.json
-	PaneTail    string // last few lines of the slave's tmux pane
+	HookCommands []string // every Stop-hook command found in settings.local.json
+	PaneTail     string   // last few lines of the slave's tmux pane
 }
 
 // Diagnose collects everything we can observe about one slave without
@@ -43,8 +45,11 @@ func Diagnose(session, id string) SlaveDiagnosis {
 		SlaveID:  id,
 		SlaveDir: state.SlaveDir(session, id),
 	}
-	if alive, err := tmux.PaneDead(session, id); err == nil {
-		d.WindowAlive = !alive
+	if dead, err := tmux.PaneDead(session, id); err == nil {
+		d.WindowAlive = !dead
+	} else if !tmux.WindowGone(err) {
+		// Unknown tmux state; leave WindowAlive=false but note it indirectly.
+		d.WindowAlive = false
 	}
 	if fi, err := os.Stat(filepath.Join(d.SlaveDir, ".ready")); err == nil {
 		d.HasReady = true
@@ -53,10 +58,11 @@ func Diagnose(session, id string) SlaveDiagnosis {
 	if fi, err := os.Stat(filepath.Join(d.SlaveDir, ".pending")); err == nil {
 		d.HasPending = true
 		d.PendingAt = fi.ModTime()
-		if b, err := os.ReadFile(filepath.Join(d.SlaveDir, ".pending")); err == nil {
-			if pid, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil {
-				d.PendingPID = pid
-				if proc, err := os.FindProcess(pid); err == nil {
+		if lock, lerr := state.ReadPending(d.SlaveDir); lerr == nil {
+			d.PendingPID = lock.PID
+			d.PendingTurn = lock.TurnID
+			if lock.PID > 0 {
+				if proc, perr := os.FindProcess(lock.PID); perr == nil {
 					d.PIDAlive = proc.Signal(syscall.Signal(0)) == nil
 				}
 			}
@@ -65,38 +71,70 @@ func Diagnose(session, id string) SlaveDiagnosis {
 	if fi, err := os.Stat(filepath.Join(d.SlaveDir, ".done")); err == nil {
 		d.HasDone = true
 		d.DoneAt = fi.ModTime()
+		if dn, derr := state.ReadDone(d.SlaveDir); derr == nil {
+			d.DoneTurn = dn.TurnID
+		}
 	}
 	if b, err := os.ReadFile(filepath.Join(d.SlaveDir, ".exit-code")); err == nil {
 		d.HasExit = true
 		d.ExitCode = strings.TrimSpace(string(b))
 	}
-	d.HookCommand = readStopHookCommand()
+	d.HookCommands = readStopHookCommands(projectCwdFromSession(session))
 	if pane, err := tmux.CapturePane(session, id, 12); err == nil {
 		d.PaneTail = strings.TrimRight(pane, "\n ")
 	}
 	return d
 }
 
-// readStopHookCommand pulls the first Stop-hook command from the
-// project-level .claude/settings.local.json, for diagnostics.
-func readStopHookCommand() string {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	b, err := os.ReadFile(filepath.Join(cwd, ".claude", "settings.local.json"))
-	if err != nil {
-		return ""
-	}
-	// Cheap parse: find the first "_internal_stop_marker" line and emit
-	// the surrounding "command" string. Avoids pulling in a JSON model
-	// just for diagnostics.
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.Contains(line, "_internal_stop_marker") {
-			return strings.TrimSpace(line)
+// projectCwdFromSession returns the cwd a conductor session was launched
+// from, by reading session.json. Falls back to os.Getwd if unavailable.
+func projectCwdFromSession(session string) string {
+	b, err := os.ReadFile(filepath.Join(state.SessionDir(session), "session.json"))
+	if err == nil {
+		var m map[string]string
+		if jerr := json.Unmarshal(b, &m); jerr == nil {
+			if cwd := m["cwd"]; cwd != "" {
+				return cwd
+			}
 		}
 	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
 	return ""
+}
+
+// readStopHookCommands properly parses the JSON to find Stop-hook command bodies.
+func readStopHookCommands(projectCwd string) []string {
+	if projectCwd == "" {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(projectCwd, ".claude", "settings.local.json"))
+	if err != nil {
+		return nil
+	}
+	var cfg struct {
+		Hooks struct {
+			Stop []struct {
+				Hooks []struct {
+					Type    string `json:"type"`
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"Stop"`
+		} `json:"hooks"`
+	}
+	if jerr := json.Unmarshal(b, &cfg); jerr != nil {
+		return nil
+	}
+	var out []string
+	for _, h := range cfg.Hooks.Stop {
+		for _, hh := range h.Hooks {
+			if hh.Command != "" {
+				out = append(out, hh.Command)
+			}
+		}
+	}
+	return out
 }
 
 // Summary returns a single-line hint suitable for stderr after a timeout.
@@ -147,21 +185,28 @@ func (d SlaveDiagnosis) Full() string {
 	fmt.Fprintf(&b, "  .pending:   %s", fileLine(d.HasPending, d.PendingAt))
 	if d.HasPending {
 		if d.PendingPID > 0 {
-			fmt.Fprintf(&b, " (pid %d %s)\n",
-				d.PendingPID, boolWord(d.PIDAlive, "alive", "STALE"))
+			fmt.Fprintf(&b, " (pid %d %s, turn=%s)\n",
+				d.PendingPID, boolWord(d.PIDAlive, "alive", "STALE"), d.PendingTurn)
 		} else {
 			fmt.Fprintf(&b, " (no pid recorded)\n")
 		}
 	} else {
 		fmt.Fprintln(&b)
 	}
-	fmt.Fprintf(&b, "  .done:      %s\n", fileLine(d.HasDone, d.DoneAt))
+	fmt.Fprintf(&b, "  .done:      %s", fileLine(d.HasDone, d.DoneAt))
+	if d.HasDone && d.DoneTurn != "" {
+		fmt.Fprintf(&b, " (turn=%s)\n", d.DoneTurn)
+	} else {
+		fmt.Fprintln(&b)
+	}
 
-	fmt.Fprintf(&b, "\nHook (from .claude/settings.local.json):\n")
-	if d.HookCommand == "" {
+	fmt.Fprintf(&b, "\nHooks (Stop) from .claude/settings.local.json:\n")
+	if len(d.HookCommands) == 0 {
 		fmt.Fprintf(&b, "  (none found)\n")
 	} else {
-		fmt.Fprintf(&b, "  %s\n", d.HookCommand)
+		for _, hc := range d.HookCommands {
+			fmt.Fprintf(&b, "  %s\n", hc)
+		}
 	}
 
 	fmt.Fprintf(&b, "\nPane tail:\n")
@@ -198,17 +243,16 @@ func (d SlaveDiagnosis) hints() []string {
 	if d.HasPending && !d.PIDAlive {
 		hs = append(hs, "Stale .pending lock detected (PID dead). Next `conductor send` will auto-clear it; or run `conductor unstick "+d.SlaveID+"`.")
 	}
-	if d.HasPending && d.PIDAlive && d.HasDone {
-		hs = append(hs, "Both .pending and .done are present — race; the next `conductor send` will treat the lock as stale.")
+	if d.HasPending && d.HasDone && d.PendingTurn != "" && d.DoneTurn != "" && d.PendingTurn != d.DoneTurn {
+		hs = append(hs, "A .done from a prior turn is sitting next to a live .pending; send will discard it on next poll.")
 	}
 	if d.HasPending && !d.HasDone && d.WindowAlive {
-		if strings.Contains(strings.ToLower(d.PaneTail), "permission") ||
-			strings.Contains(strings.ToLower(d.PaneTail), "y/n") ||
-			strings.Contains(strings.ToLower(d.PaneTail), "yes/no") {
+		lp := strings.ToLower(d.PaneTail)
+		if strings.Contains(lp, "permission") || strings.Contains(lp, "y/n") || strings.Contains(lp, "yes/no") {
 			hs = append(hs, "Pane appears to be waiting on an interactive prompt; `--dangerously-skip-permissions` did not cover it.")
 		}
 	}
-	if d.HookCommand == "" {
+	if len(d.HookCommands) == 0 {
 		hs = append(hs, "No Stop-hook command found in .claude/settings.local.json — `conductor send` will always time out.")
 	}
 	if len(hs) == 0 {

@@ -86,6 +86,8 @@ func parseSessionName(s string) string {
 }
 
 // PaneDead reports whether the given window's first pane is marked dead.
+// On error the bool is false and the caller should consult WindowGone to
+// decide if the error itself indicates the window no longer exists.
 func PaneDead(session, window string) (bool, error) {
 	out, err := exec.Command("tmux", "list-panes",
 		"-t", session+":"+window, "-F", "#{pane_dead}").Output()
@@ -93,6 +95,35 @@ func PaneDead(session, window string) (bool, error) {
 		return false, err
 	}
 	return parsePaneDead(string(out)), nil
+}
+
+// WindowGone classifies an error from PaneDead/CapturePane as a "the window
+// does not exist" condition. tmux writes "can't find window" / "can't find
+// pane" on stderr when the target is gone; exec.Cmd surfaces that as an
+// *exec.ExitError whose Stderr we can inspect.
+func WindowGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ee *exec.ExitError
+	if !errorsAs(err, &ee) {
+		return strings.Contains(err.Error(), "can't find")
+	}
+	s := strings.ToLower(string(ee.Stderr))
+	return strings.Contains(s, "can't find") ||
+		strings.Contains(s, "no such") ||
+		strings.Contains(s, "not found")
+}
+
+// errorsAs is a tiny shim to avoid pulling in `errors` just for As().
+func errorsAs(err error, target any) bool {
+	if ee, ok := err.(*exec.ExitError); ok {
+		if p, ok := target.(**exec.ExitError); ok {
+			*p = ee
+			return true
+		}
+	}
+	return false
 }
 
 // CapturePane returns the last n lines of the given window's pane buffer.

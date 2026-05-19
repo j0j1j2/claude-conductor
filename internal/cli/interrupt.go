@@ -20,6 +20,9 @@ var interruptCmd = &cobra.Command{
 			return CLIError(exitcode.InternalError, "%v", err)
 		}
 		id := args[0]
+		if err := state.ValidateSlaveID(id); err != nil {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
+		}
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}

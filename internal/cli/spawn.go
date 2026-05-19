@@ -35,18 +35,31 @@ var spawnCmd = &cobra.Command{
 		if id == "" {
 			id = nextSlaveID(sess)
 		}
-		if state.SlaveExists(sess, id) {
-			return CLIError(exitcode.InternalError, "slave %q already exists", id)
+		if err := state.ValidateSlaveID(id); err != nil {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
 		}
 
 		slaveDir := state.SlaveDir(sess, id)
-		if err := os.MkdirAll(slaveDir, 0o755); err != nil {
-			return err
+		if slaveDir == "" {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q", id)
 		}
-		// If anything below fails, tear down the half-built slave so
-		// the next attempt is not blocked by leftover files / window.
+
+		// Atomic claim: Mkdir (not MkdirAll) returns EEXIST if another
+		// concurrent spawn beat us. This is the gating step against two
+		// `conductor spawn` calls racing for the same auto-allocated name.
+		if err := os.MkdirAll(state.SessionDir(sess), 0o755); err != nil {
+			return CLIError(exitcode.InternalError, "mkdir session dir: %v", err)
+		}
+		if err := os.Mkdir(slaveDir, 0o755); err != nil {
+			if os.IsExist(err) {
+				return CLIError(exitcode.InternalError, "slave %q already exists", id)
+			}
+			return CLIError(exitcode.InternalError, "mkdir slave dir: %v", err)
+		}
+
 		windowCreated := false
 		spawnSucceeded := false
+		var restoreHooks func()
 		defer func() {
 			if spawnSucceeded {
 				return
@@ -54,36 +67,39 @@ var spawnCmd = &cobra.Command{
 			if windowCreated {
 				_ = tmux.KillWindowCmd(sess, id).Run()
 			}
+			if restoreHooks != nil {
+				restoreHooks()
+			}
 			_ = os.RemoveAll(slaveDir)
 		}()
 
 		conductorBin, err := os.Executable()
 		if err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "os.Executable: %v", err)
 		}
 		projectCwd, err := os.Getwd()
 		if err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "os.Getwd: %v", err)
 		}
 
-		// Ensure the project-level hook settings are installed (no-op if already written).
-		if err := installProjectHooks(projectCwd, conductorBin); err != nil {
+		restoreHooks, err = installProjectHooks(projectCwd, conductorBin)
+		if err != nil {
 			return CLIError(exitcode.InternalError, "install project hooks: %v", err)
 		}
 
 		runShPath := filepath.Join(slaveDir, "run.sh")
 		runShContent := hooks.RenderRunScript(slaveDir, projectCwd, id)
 		if err := os.WriteFile(runShPath, []byte(runShContent), 0o755); err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "write run.sh: %v", err)
 		}
 
 		w, err := fsnotify.NewWatcher()
 		if err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "fsnotify: %v", err)
 		}
 		defer w.Close()
 		if err := w.Add(slaveDir); err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "fsnotify watch: %v", err)
 		}
 
 		if err := tmux.NewWindowCmd(sess, id, runShPath).Run(); err != nil {
@@ -100,14 +116,26 @@ var spawnCmd = &cobra.Command{
 		timeout := time.After(30 * time.Second)
 		for {
 			select {
-			case ev := <-w.Events:
-				if ev.Op&fsnotify.Create == fsnotify.Create && filepath.Base(ev.Name) == ".ready" {
+			case ev, ok := <-w.Events:
+				if !ok {
+					return CLIError(exitcode.InternalError, "fsnotify channel closed")
+				}
+				if ev.Op&fsnotify.Create == fsnotify.Create &&
+					filepath.Base(ev.Name) == ".ready" {
 					spawnSucceeded = true
 					fmt.Println(id)
 					return nil
 				}
-			case err := <-w.Errors:
-				return err
+				// SessionStart hook failed and dropped a .ready-error.
+				if filepath.Base(ev.Name) == ".ready-error" {
+					b, _ := os.ReadFile(ev.Name)
+					return CLIError(exitcode.Crash, "slave failed during SessionStart hook: %s", strings.TrimSpace(string(b)))
+				}
+			case werr, ok := <-w.Errors:
+				if !ok {
+					return CLIError(exitcode.InternalError, "fsnotify error channel closed")
+				}
+				return CLIError(exitcode.InternalError, "fsnotify: %v", werr)
 			case <-timeout:
 				return CLIError(exitcode.Crash, "slave did not become ready within 30s")
 			}

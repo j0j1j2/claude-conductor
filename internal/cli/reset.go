@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
@@ -11,6 +13,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
 )
+
+var resetForce bool
 
 var resetCmd = &cobra.Command{
 	Use:   "reset <slave-id>",
@@ -25,12 +29,19 @@ var resetCmd = &cobra.Command{
 			return CLIError(exitcode.InternalError, "%v", err)
 		}
 		id := args[0]
+		if err := state.ValidateSlaveID(id); err != nil {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
+		}
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
 		slaveDir := state.SlaveDir(sess, id)
+		if state.IsBusy(slaveDir) && !resetForce {
+			return CLIError(exitcode.Busy,
+				"slave %s is busy; use `conductor interrupt %s` first, or pass --force", id, id)
+		}
 
-		for _, f := range []string{".pending", ".done", ".ready", ".exit-code"} {
+		for _, f := range []string{".pending", ".done", ".ready", ".exit-code", ".ready-error"} {
 			_ = os.Remove(filepath.Join(slaveDir, f))
 		}
 
@@ -44,26 +55,35 @@ var resetCmd = &cobra.Command{
 
 		w, err := fsnotify.NewWatcher()
 		if err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "fsnotify: %v", err)
 		}
 		defer w.Close()
 		if err := w.Add(slaveDir); err != nil {
-			return err
+			return CLIError(exitcode.InternalError, "fsnotify watch: %v", err)
 		}
 
-		if err := tmux.SendKeysCmd(sess, id, runShPath, "Enter").Run(); err != nil {
+		// Quote runShPath so a HOME containing spaces does not break the
+		// shell that tmux delivers our keystrokes to.
+		quoted := fmt.Sprintf("'%s'", strings.ReplaceAll(runShPath, "'", `'\''`))
+		if err := tmux.SendKeysCmd(sess, id, quoted, "Enter").Run(); err != nil {
 			return CLIError(exitcode.InternalError, "relaunch run.sh: %v", err)
 		}
 
 		deadline := time.After(30 * time.Second)
 		for {
 			select {
-			case ev := <-w.Events:
+			case ev, ok := <-w.Events:
+				if !ok {
+					return CLIError(exitcode.InternalError, "fsnotify channel closed")
+				}
 				if ev.Op&fsnotify.Create == fsnotify.Create && filepath.Base(ev.Name) == ".ready" {
 					return nil
 				}
-			case err := <-w.Errors:
-				return err
+			case werr, ok := <-w.Errors:
+				if !ok {
+					return CLIError(exitcode.InternalError, "fsnotify error channel closed")
+				}
+				return CLIError(exitcode.InternalError, "fsnotify: %v", werr)
 			case <-deadline:
 				return CLIError(exitcode.Crash, "slave did not become ready within 30s after reset")
 			}
@@ -72,5 +92,6 @@ var resetCmd = &cobra.Command{
 }
 
 func init() {
+	resetCmd.Flags().BoolVar(&resetForce, "force", false, "reset even if a `conductor send` is in flight")
 	Root.AddCommand(resetCmd)
 }

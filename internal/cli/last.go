@@ -12,7 +12,7 @@ import (
 
 var lastCmd = &cobra.Command{
 	Use:   "last <slave-id>",
-	Short: "Print slave's last assistant response (non-blocking)",
+	Short: "Print slave's last assistant response (non-blocking; empty if none yet)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !tmux.InTmux() {
@@ -23,17 +23,20 @@ var lastCmd = &cobra.Command{
 			return CLIError(exitcode.InternalError, "%v", err)
 		}
 		id := args[0]
+		if err := state.ValidateSlaveID(id); err != nil {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
+		}
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
-		content, err := state.ReadDone(state.SlaveDir(sess, id))
+		d, err := state.ReadDone(state.SlaveDir(sess, id))
 		if err != nil {
 			if os.IsNotExist(err) {
-				return CLIError(exitcode.InternalError, "no prior response for %s", id)
+				return nil // no prior response yet; exit 0 with empty stdout
 			}
-			return err
+			return CLIError(exitcode.InternalError, "read .done: %v", err)
 		}
-		fmt.Print(content)
+		fmt.Print(d.Text)
 		return nil
 	},
 }

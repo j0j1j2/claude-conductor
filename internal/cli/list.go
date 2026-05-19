@@ -26,13 +26,16 @@ var listCmd = &cobra.Command{
 			if os.IsNotExist(err) {
 				return nil
 			}
-			return err
+			return CLIError(exitcode.InternalError, "read session dir: %v", err)
 		}
 		for _, e := range entries {
 			if !e.IsDir() || e.Name() == "master" {
 				continue
 			}
 			id := e.Name()
+			if state.ValidateSlaveID(id) != nil {
+				continue
+			}
 			st := "idle"
 			if state.IsBusy(state.SlaveDir(sess, id)) {
 				st = "busy"

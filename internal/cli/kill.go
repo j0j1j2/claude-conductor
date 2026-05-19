@@ -9,6 +9,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var killForce bool
+
 var killCmd = &cobra.Command{
 	Use:   "kill <slave-id>",
 	Short: "Close the slave's tmux window and remove its state dir",
@@ -22,13 +24,20 @@ var killCmd = &cobra.Command{
 			return CLIError(exitcode.InternalError, "%v", err)
 		}
 		id := args[0]
+		if err := state.ValidateSlaveID(id); err != nil {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
+		}
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
+		slaveDir := state.SlaveDir(sess, id)
+		if state.IsBusy(slaveDir) && !killForce {
+			return CLIError(exitcode.Busy,
+				"slave %s is busy; use `conductor interrupt %s` first, or pass --force", id, id)
+		}
 
 		_ = tmux.KillWindowCmd(sess, id).Run()
-
-		if err := os.RemoveAll(state.SlaveDir(sess, id)); err != nil {
+		if err := os.RemoveAll(slaveDir); err != nil {
 			return CLIError(exitcode.InternalError, "remove state dir: %v", err)
 		}
 		return nil
@@ -36,5 +45,6 @@ var killCmd = &cobra.Command{
 }
 
 func init() {
+	killCmd.Flags().BoolVar(&killForce, "force", false, "kill even if a `conductor send` is in flight")
 	Root.AddCommand(killCmd)
 }

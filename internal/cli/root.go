@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -33,13 +34,15 @@ func writeAudit(cmd *cobra.Command, args []string, exit int) {
 		return
 	}
 	path := filepath.Join(state.SessionDir(sess), "audit.log")
-	_ = audit.Append(path, audit.Entry{
+	if err := audit.Append(path, audit.Entry{
 		Timestamp:  time.Now().UTC(),
 		Cmd:        cmd.Name(),
 		Args:       args,
 		DurationMS: time.Since(cmdStart).Milliseconds(),
 		Exit:       exit,
-	})
+	}); err != nil && os.Getenv("CONDUCTOR_DEBUG") != "" {
+		fmt.Fprintln(os.Stderr, "warn: audit append:", err)
+	}
 }
 
 // ExitError carries a CLI exit code up to main.go.

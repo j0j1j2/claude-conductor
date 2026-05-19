@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -10,9 +11,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var unstickForce bool
+
 var unstickCmd = &cobra.Command{
 	Use:   "unstick <slave-id>",
-	Short: "Force-clear a stale .pending lock without touching the running slave",
+	Short: "Clear a stale .pending lock; refuses live locks unless --force",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !tmux.InTmux() {
@@ -23,17 +26,27 @@ var unstickCmd = &cobra.Command{
 			return CLIError(exitcode.InternalError, "%v", err)
 		}
 		id := args[0]
+		if err := state.ValidateSlaveID(id); err != nil {
+			return CLIError(exitcode.UnknownSlave, "invalid slave id %q: %v", id, err)
+		}
 		if !state.SlaveExists(sess, id) {
 			return CLIError(exitcode.UnknownSlave, "unknown slave %q", id)
 		}
 		slaveDir := state.SlaveDir(sess, id)
+		if state.IsBusy(slaveDir) && !unstickForce {
+			lock, _ := state.ReadPending(slaveDir)
+			return CLIError(exitcode.Busy,
+				"slave %s has a LIVE lock (pid %d); refusing without --force", id, lock.PID)
+		}
 		for _, f := range []string{".pending", ".done"} {
 			_ = os.Remove(filepath.Join(slaveDir, f))
 		}
+		fmt.Fprintln(os.Stderr, "cleared .pending and .done for", id)
 		return nil
 	},
 }
 
 func init() {
+	unstickCmd.Flags().BoolVar(&unstickForce, "force", false, "clear even a live (PID-alive) lock")
 	Root.AddCommand(unstickCmd)
 }

@@ -2,10 +2,14 @@
 package state
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,6 +17,40 @@ import (
 
 // ErrBusy means a live .pending lock blocks a new send.
 var ErrBusy = errors.New("state: slave is busy")
+
+// ErrInvalidSlaveID means the slave ID did not pass the safety allow-list.
+var ErrInvalidSlaveID = errors.New("state: invalid slave id (must match [a-zA-Z0-9_-]{1,32}, not reserved)")
+
+// ErrTurnMismatch means a .done was written by a different turn than the one
+// the caller is waiting for. The caller should ignore it and keep waiting.
+var ErrTurnMismatch = errors.New("state: .done belongs to a different turn")
+
+// slaveIDRe is the allow-list applied to every slave identifier flowing into
+// filesystem paths or hook arguments.
+var slaveIDRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`)
+
+// reservedSlaveIDs are names that have a special role in the layout and may
+// not be used as slave IDs (would collide with master state, etc.).
+var reservedSlaveIDs = map[string]bool{
+	"master":    true,
+	"sessions":  true,
+	"audit.log": true,
+}
+
+// ValidateSlaveID returns nil iff id is safe to use in paths, tmux window
+// names, and hook arguments.
+func ValidateSlaveID(id string) error {
+	if !slaveIDRe.MatchString(id) {
+		return ErrInvalidSlaveID
+	}
+	if reservedSlaveIDs[id] {
+		return ErrInvalidSlaveID
+	}
+	if strings.HasPrefix(id, "-") || strings.HasPrefix(id, "_internal_") {
+		return ErrInvalidSlaveID
+	}
+	return nil
+}
 
 // RootDir returns ~/.conductor.
 func RootDir() string {
@@ -25,54 +63,127 @@ func SessionDir(session string) string {
 	return filepath.Join(RootDir(), "sessions", session)
 }
 
-// SlaveDir returns ~/.conductor/sessions/<session>/<id>.
+// SlaveDir returns ~/.conductor/sessions/<session>/<id>. The id is validated
+// to prevent path traversal; on invalid input it returns an empty string so
+// any subsequent filesystem op fails clearly rather than silently escaping.
 func SlaveDir(session, id string) string {
+	if ValidateSlaveID(id) != nil {
+		return ""
+	}
 	return filepath.Join(SessionDir(session), id)
 }
 
 // SlaveExists reports whether the slave's state dir exists.
 func SlaveExists(session, id string) bool {
-	_, err := os.Stat(SlaveDir(session, id))
+	dir := SlaveDir(session, id)
+	if dir == "" {
+		return false
+	}
+	_, err := os.Stat(dir)
 	return err == nil
 }
 
-// CreatePending creates the `.pending` file exclusively, recording the
-// current process's PID inside it. If the file already exists, the lock is
-// validated:
-//   - A `.done` sitting next to it means the slave already finished — the
-//     lock is stale (probably a previous send that was interrupted before
-//     it could clean up). Replace and continue.
-//   - The recorded PID is no longer alive — the lock is stale (the previous
-//     conductor process crashed or was killed). Replace and continue.
+// PendingLock is the structured content of a .pending file. The TurnID lets
+// `_internal_stop_marker` tag .done with the same turn the caller asked for,
+// so a delayed prior-turn Stop hook cannot impersonate the current turn.
+type PendingLock struct {
+	PID    int    `json:"pid"`
+	TurnID string `json:"turn_id"`
+}
+
+// NewTurnID returns a fresh per-send identifier.
+func NewTurnID() string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// CreatePending creates the `.pending` file exclusively, recording PID and a
+// fresh TurnID. On contention the existing lock is validated:
+//   - A `.done` for the same turn means we are seeing our own completion arrive
+//     in a race; that's not "busy", but it's also not a clean takeover — we
+//     return ErrBusy so the caller can re-attempt. (Practically rare.)
+//   - The recorded PID is no longer alive — the lock is stale.
 //   - Otherwise the lock is live → ErrBusy.
-func CreatePending(slaveDir string) error {
-	pendingPath := filepath.Join(slaveDir, ".pending")
-	if err := writePending(pendingPath); err == nil {
-		return nil
+//
+// Returns the newly written turn ID on success.
+func CreatePending(slaveDir string) (string, error) {
+	turnID := NewTurnID()
+	if err := writePending(slaveDir, PendingLock{PID: os.Getpid(), TurnID: turnID}); err == nil {
+		return turnID, nil
 	} else if !os.IsExist(err) {
-		return err
+		return "", err
 	}
 
 	if !isPendingStale(slaveDir) {
-		return ErrBusy
+		return "", ErrBusy
 	}
-	// Stale lock: replace it.
-	_ = os.Remove(pendingPath)
-	return writePending(pendingPath)
+
+	// Stale lock takeover: rewrite atomically via tmp+rename so a concurrent
+	// taker doesn't see a half-written file or step on us.
+	if err := writePendingForce(slaveDir, PendingLock{PID: os.Getpid(), TurnID: turnID}); err != nil {
+		return "", err
+	}
+	return turnID, nil
 }
 
-func writePending(pendingPath string) error {
+// writePending is the exclusive-create path used on a fresh lock.
+func writePending(slaveDir string, lock PendingLock) error {
+	pendingPath := filepath.Join(slaveDir, ".pending")
 	f, err := os.OpenFile(pendingPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
-	return f.Close()
+	enc := json.NewEncoder(f)
+	if encErr := enc.Encode(lock); encErr != nil {
+		_ = f.Close()
+		_ = os.Remove(pendingPath)
+		return fmt.Errorf("write pending: %w", encErr)
+	}
+	if cErr := f.Close(); cErr != nil {
+		_ = os.Remove(pendingPath)
+		return fmt.Errorf("close pending: %w", cErr)
+	}
+	return nil
+}
+
+// writePendingForce is the atomic-rename path used during stale takeover.
+func writePendingForce(slaveDir string, lock PendingLock) error {
+	tmp := filepath.Join(slaveDir, ".pending.tmp")
+	final := filepath.Join(slaveDir, ".pending")
+	b, err := json.Marshal(lock)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// ReadPending returns the active lock or os.ErrNotExist if no lock is held.
+func ReadPending(slaveDir string) (PendingLock, error) {
+	b, err := os.ReadFile(filepath.Join(slaveDir, ".pending"))
+	if err != nil {
+		return PendingLock{}, err
+	}
+	// Tolerate the legacy plain-PID format for graceful upgrade.
+	trimmed := strings.TrimSpace(string(b))
+	if pid, atoiErr := strconv.Atoi(trimmed); atoiErr == nil {
+		return PendingLock{PID: pid}, nil
+	}
+	var lock PendingLock
+	if err := json.Unmarshal(b, &lock); err != nil {
+		return PendingLock{}, err
+	}
+	return lock, nil
 }
 
 // IsBusy reports whether the slave currently holds a live .pending lock.
-// A .pending file is considered NOT busy if (a) a sibling .done exists, or
-// (b) the PID written into .pending is no longer alive.
 func IsBusy(slaveDir string) bool {
 	if _, err := os.Stat(filepath.Join(slaveDir, ".pending")); err != nil {
 		return false
@@ -81,24 +192,22 @@ func IsBusy(slaveDir string) bool {
 }
 
 // isPendingStale reports whether an existing .pending lock is no longer
-// meaningful (slave already finished, or the holder process is gone).
+// meaningful (PID gone). A sibling .done is NOT sufficient evidence on its
+// own anymore — the .done could be from the SAME live turn that simply
+// completed. The owning send will clean up its own lock; if it didn't (it
+// crashed) we'll see PID-dead and clear the lock then.
 func isPendingStale(slaveDir string) bool {
-	if _, err := os.Stat(filepath.Join(slaveDir, ".done")); err == nil {
+	lock, err := ReadPending(slaveDir)
+	if err != nil {
+		return true // unreadable / unparseable lock → safe to replace
+	}
+	if lock.PID <= 0 {
 		return true
 	}
-	b, err := os.ReadFile(filepath.Join(slaveDir, ".pending"))
+	proc, err := os.FindProcess(lock.PID)
 	if err != nil {
 		return true
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil || pid <= 0 {
-		return true
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return true
-	}
-	// Signal 0 probes for process existence without delivering anything.
 	return proc.Signal(syscall.Signal(0)) != nil
 }
 
@@ -120,20 +229,54 @@ func RemoveDone(slaveDir string) error {
 	return nil
 }
 
-// WriteDone atomically writes the completion message to `.done`.
-func WriteDone(slaveDir, content string) error {
-	tmp := filepath.Join(slaveDir, ".done.tmp")
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(slaveDir, ".done"))
+// Done is the on-disk shape of a .done file: the response text the slave
+// produced for a specific turn.
+type Done struct {
+	TurnID string `json:"turn_id"`
+	Text   string `json:"text"`
 }
 
-// ReadDone reads the `.done` file.
-func ReadDone(slaveDir string) (string, error) {
+// WriteDone atomically writes a turn's completion to `.done`. The tmp file
+// is removed on rename failure so it does not linger.
+func WriteDone(slaveDir, turnID, content string) error {
+	tmp := filepath.Join(slaveDir, ".done.tmp")
+	final := filepath.Join(slaveDir, ".done")
+	b, err := json.Marshal(Done{TurnID: turnID, Text: content})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename .done.tmp -> .done: %w", err)
+	}
+	return nil
+}
+
+// ReadDone reads a `.done` file. If the file is in the legacy plain-text
+// format (no TurnID), the returned Done has an empty TurnID; callers should
+// then accept it (no turn-matching enforced for legacy content).
+func ReadDone(slaveDir string) (Done, error) {
 	b, err := os.ReadFile(filepath.Join(slaveDir, ".done"))
 	if err != nil {
-		return "", err
+		return Done{}, err
 	}
-	return string(b), nil
+	trimmed := strings.TrimSpace(string(b))
+	if !strings.HasPrefix(trimmed, "{") {
+		return Done{Text: string(b)}, nil
+	}
+	var d Done
+	if jerr := json.Unmarshal(b, &d); jerr != nil {
+		return Done{Text: string(b)}, nil // fallback: treat as raw text
+	}
+	return d, nil
+}
+
+// WriteDoneError writes a sentinel .done indicating a hook-side failure, so
+// `conductor send` returns promptly with a useful message instead of timing
+// out. The turn ID is included if known.
+func WriteDoneError(slaveDir, turnID, errMsg string) error {
+	return WriteDone(slaveDir, turnID, "[conductor hook error] "+errMsg)
 }

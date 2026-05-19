@@ -3,6 +3,7 @@ package cli
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -70,7 +71,7 @@ func outsideTmux(projectCwd string) error {
 	sessionName := sessionNameFromCwd(projectCwd)
 	conductorBin, err := os.Executable()
 	if err != nil {
-		return err
+		return CLIError(exitcode.InternalError, "os.Executable: %v", err)
 	}
 
 	// If session already exists, just attach.
@@ -80,30 +81,23 @@ func outsideTmux(projectCwd string) error {
 		return att.Run()
 	}
 
-	// Create session with the default shell in window 0 (NOT conductor —
-	// if we ran the conductor binary directly as the pane process, window 0
-	// would close as soon as this function returned).
 	newCmd := tmux.NewSessionCmdShell(sessionName)
 	newCmd.Dir = projectCwd
 	if err := newCmd.Run(); err != nil {
 		return CLIError(exitcode.InternalError, "tmux new-session: %v", err)
 	}
 
-	// Now that the new tmux session exists, any prior state directory is
-	// from a dead run and is safely obsolete. Wiping it AFTER the new
-	// session creation avoids destroying state if `tmux new-session` had
-	// failed for any reason.
+	// Wipe any stale state directory from a prior dead session.
 	if err := os.RemoveAll(state.SessionDir(sessionName)); err != nil {
-		_ = tmux.KillWindowCmd(sessionName, "0").Run()
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
 		return CLIError(exitcode.InternalError, "clean stale state dir: %v", err)
 	}
 
-	// Type `conductor` into window 0's shell so we re-enter with $TMUX set.
 	if err := tmux.SendKeysCmd(sessionName, "0", conductorBin, "Enter").Run(); err != nil {
+		_ = exec.Command("tmux", "kill-session", "-t", sessionName).Run()
 		return CLIError(exitcode.InternalError, "send-keys conductor: %v", err)
 	}
 
-	// Attach.
 	att := tmux.AttachSessionCmd(sessionName)
 	att.Stdin, att.Stdout, att.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return att.Run()
@@ -114,7 +108,6 @@ func outsideTmux(projectCwd string) error {
 // different directories that happen to share a basename.
 func sessionNameFromCwd(cwd string) string {
 	base := filepath.Base(cwd)
-	// Sanitize: tmux dislikes '.' and ':' in session names.
 	base = strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
@@ -122,8 +115,26 @@ func sessionNameFromCwd(cwd string) string {
 		}
 		return '_'
 	}, base)
+	if base == "" || base == "_" {
+		base = "session"
+	}
 	sum := sha1.Sum([]byte(cwd))
 	return fmt.Sprintf("conductor-%s-%s", base, hex.EncodeToString(sum[:3]))
+}
+
+// scrubbedEnv returns os.Environ() minus any CONDUCTOR_SLAVE_ID entry so the
+// master claude does not inherit a slave gate from the user's shell. Without
+// this scrub, the master's own Stop hook could fire and corrupt slave state.
+func scrubbedEnv() []string {
+	in := os.Environ()
+	out := make([]string, 0, len(in))
+	for _, kv := range in {
+		if strings.HasPrefix(kv, "CONDUCTOR_SLAVE_ID=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // insideTmux: do per-session setup, pre-spawn s1, then *replace* this
@@ -131,30 +142,47 @@ func sessionNameFromCwd(cwd string) string {
 func insideTmux(projectCwd string) error {
 	sess, err := tmux.CurrentSession()
 	if err != nil {
-		return err
+		return CLIError(exitcode.InternalError, "current tmux session: %v", err)
 	}
 	sessionDir := state.SessionDir(sess)
 	masterDir := filepath.Join(sessionDir, "master")
 	if err := os.MkdirAll(masterDir, 0o755); err != nil {
-		return err
+		return CLIError(exitcode.InternalError, "mkdir master dir: %v", err)
 	}
 	systemPath := filepath.Join(masterDir, "SYSTEM.md")
 	if err := os.WriteFile(systemPath, []byte(masterSystemPrompt), 0o644); err != nil {
-		return err
+		return CLIError(exitcode.InternalError, "write SYSTEM.md: %v", err)
 	}
 
-	sessionJSON := fmt.Sprintf(`{"session":"%s","cwd":"%s","started":"%s"}`,
-		sess, projectCwd, time.Now().UTC().Format(time.RFC3339))
-	if err := os.WriteFile(filepath.Join(sessionDir, "session.json"), []byte(sessionJSON), 0o644); err != nil {
-		return err
+	sessionMeta, err := json.Marshal(map[string]string{
+		"session": sess,
+		"cwd":     projectCwd,
+		"started": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return CLIError(exitcode.InternalError, "marshal session.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "session.json"), sessionMeta, 0o644); err != nil {
+		return CLIError(exitcode.InternalError, "write session.json: %v", err)
 	}
 
-	conductorBin, _ := os.Executable()
-	if err := installProjectHooks(projectCwd, conductorBin); err != nil {
+	conductorBin, err := os.Executable()
+	if err != nil {
+		return CLIError(exitcode.InternalError, "os.Executable: %v", err)
+	}
+
+	restoreHooks, err := installProjectHooks(projectCwd, conductorBin)
+	if err != nil {
 		return CLIError(exitcode.InternalError, "install project hooks: %v", err)
 	}
+	bootstrapSucceeded := false
+	defer func() {
+		if !bootstrapSucceeded {
+			restoreHooks()
+			_ = os.RemoveAll(masterDir)
+		}
+	}()
 
-	// Pre-spawn s1 in window 1.
 	spawnCmd := exec.Command(conductorBin, "spawn", "--name", "s1")
 	spawnCmd.Stdout = os.Stdout
 	spawnCmd.Stderr = os.Stderr
@@ -162,11 +190,9 @@ func insideTmux(projectCwd string) error {
 		return CLIError(exitcode.InternalError, "pre-spawn s1: %v", err)
 	}
 
-	// Read system prompt into memory so we can pass it as a single argv
-	// element (avoids shell-quoting pain).
 	sysBytes, err := os.ReadFile(systemPath)
 	if err != nil {
-		return err
+		return CLIError(exitcode.InternalError, "read SYSTEM.md: %v", err)
 	}
 
 	claudePath, err := exec.LookPath("claude")
@@ -179,8 +205,10 @@ func insideTmux(projectCwd string) error {
 		"--append-system-prompt", string(sysBytes),
 		"--dangerously-skip-permissions",
 	}
-	// Replace the conductor process with claude. Does not return on success.
-	if err := syscall.Exec(claudePath, argv, os.Environ()); err != nil {
+	// We are about to hand the process off to claude permanently. After this
+	// point our defers will not run, so we mark bootstrap successful first.
+	bootstrapSucceeded = true
+	if err := syscall.Exec(claudePath, argv, scrubbedEnv()); err != nil {
 		return CLIError(exitcode.InternalError, "exec claude: %v", err)
 	}
 	return nil
