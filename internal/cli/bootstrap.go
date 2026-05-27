@@ -15,6 +15,7 @@ import (
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
 	"github.com/j0j1j2/claude-conductor/internal/state"
 	"github.com/j0j1j2/claude-conductor/internal/tmux"
+	"github.com/j0j1j2/claude-conductor/internal/trust"
 	"github.com/spf13/cobra"
 )
 
@@ -155,6 +156,12 @@ func insideTmux(projectCwd string) error {
 	sess, err := tmux.CurrentSession()
 	if err != nil {
 		return CLIError(exitcode.InternalError, "current tmux session: %v", err)
+	}
+	// Mark cwd as trusted in ~/.claude.json BEFORE spawning any claude. The
+	// workspace-trust dialog is gated separately from --dangerously-skip-permissions
+	// and would otherwise block master/slave startup driven by tmux send-keys.
+	if err := trust.EnsureCwdTrusted(projectCwd); err != nil {
+		return CLIError(exitcode.InternalError, "mark cwd trusted: %v", err)
 	}
 	sessionDir := state.SessionDir(sess)
 	masterDir := filepath.Join(sessionDir, "master")
