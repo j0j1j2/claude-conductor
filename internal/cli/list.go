@@ -6,6 +6,7 @@ import (
 
 	"github.com/j0j1j2/claude-conductor/internal/exitcode"
 	"github.com/j0j1j2/claude-conductor/internal/state"
+	"github.com/j0j1j2/claude-conductor/internal/transcript"
 	"github.com/j0j1j2/claude-conductor/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -36,11 +37,21 @@ var listCmd = &cobra.Command{
 			if state.ValidateSlaveID(id) != nil {
 				continue
 			}
+			slaveDir := state.SlaveDir(sess, id)
 			st := "idle"
-			if state.IsBusy(state.SlaveDir(sess, id)) {
+			if state.IsBusy(slaveDir) {
 				st = "busy"
 			}
-			fmt.Printf("%s\t%s\n", id, st)
+			// Per-agent token spend, read from the slave's own transcript. A
+			// missing or usage-free transcript reports zero, never an error --
+			// a slave that has not spoken yet has simply cost nothing.
+			tokens := 0
+			if path := state.ReadTranscriptPath(slaveDir); path != "" {
+				if u, err := transcript.TokensUsed(path); err == nil {
+					tokens = u.Total()
+				}
+			}
+			fmt.Printf("%s\t%s\t%d\n", id, st, tokens)
 		}
 		return nil
 	},
